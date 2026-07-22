@@ -68,17 +68,28 @@ func NewShadow(shadowURL string, sampleRate float64, queueSize, workers int) (*S
 func (s *Shadow) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if isMirrored(r) {
+			ShadowLoops.Add(1)
 			log.Printf("loop guard: dropping already-mirrored request %s %s", r.Method, r.URL.Path)
 			http.Error(w, "shadow traffic loop detected", http.StatusLoopDetected)
 			return
 		}
 
 		// Sample before buffering: unsampled requests never pay the copy.
-		if s.sampled() {
-			// Over-limit and unreadable bodies still go to the primary, unmirrored.
-			if body, err := BufferBody(r); err == nil {
-				s.Dispatch(r, body)
-			}
+		if !s.sampled() {
+			ShadowUnsampled.Add(1)
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		// Over-limit and unreadable bodies still go to the primary, unmirrored.
+		body, err := BufferBody(r)
+		switch {
+		case errors.Is(err, ErrPayloadTooLarge):
+			ShadowTooLarge.Add(1)
+		case err != nil:
+			log.Printf("shadow buffering failed: %s %s: %v", r.Method, r.URL.Path, err)
+		default:
+			s.Dispatch(r, body)
 		}
 		next.ServeHTTP(w, r)
 	})
@@ -97,9 +108,15 @@ func (s *Shadow) Dispatch(r *http.Request, body []byte) {
 
 	select {
 	case s.queue <- req:
-	default: // Queue full — drop silently.
+	default:
+		ShadowDropped.Add(1) // Queue full — drop silently, counted only.
 	}
 }
+
+// QueueDepth is the number of clones waiting for a worker. Publish it as a
+// gauge if you want it in /metrics; it is not registered here because a process
+// may hold more than one Shadow and expvar names must be unique.
+func (s *Shadow) QueueDepth() int { return len(s.queue) }
 
 func (s *Shadow) worker() {
 	for req := range s.queue {
@@ -110,10 +127,12 @@ func (s *Shadow) worker() {
 func (s *Shadow) send(req *http.Request) {
 	resp, err := s.Client.Do(req)
 	if err != nil {
+		ShadowErrors.Add(1)
 		return // Fail silently. Shadow problems must never surface to the client.
 	}
 	defer resp.Body.Close()
 	io.Copy(io.Discard, resp.Body) // Drain so the connection returns to the pool.
+	ShadowDispatched.Add(1)
 }
 
 // sampled reports whether this request is one of the mirrored ones.

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"expvar"
 	"log"
 	"net/http"
 	"time"
@@ -31,9 +32,22 @@ func main() {
 		if err != nil {
 			log.Fatalf("shadow config: %v", err)
 		}
+		expvar.Publish("shadow_queue_depth", expvar.Func(func() any { return shadow.QueueDepth() }))
+
 		handler = shadow.Middleware(primary)
 		log.Printf("mirroring %.1f%% of traffic to shadow %s (queue %d, workers %d)",
 			sampleRate, shadowURL, queueSize, workers)
+	}
+	handler = proxy.Instrument(handler)
+
+	// ponytail: ServeMux is enough routing for one carve-out. Set METRICS_PATH
+	// to "" if a real route collides with it.
+	if metricsPath := env("METRICS_PATH", "/metrics"); metricsPath != "" {
+		mux := http.NewServeMux()
+		mux.Handle(metricsPath, proxy.MetricsHandler())
+		mux.Handle("/", handler)
+		handler = mux
+		log.Printf("metrics on %s", metricsPath)
 	}
 
 	srv := &http.Server{
