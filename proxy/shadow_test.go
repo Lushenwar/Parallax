@@ -120,6 +120,56 @@ func TestPrimaryUnaffectedWhenShadowIsDown(t *testing.T) {
 	}
 }
 
+func TestShadowRequestsAreMarked(t *testing.T) {
+	got := make(chan captured, 1)
+	front := newStack(t, func(w http.ResponseWriter, r *http.Request) {
+		got <- captured{r.Method, r.URL.Path, r.URL.RawQuery, r.Header.Clone(), ""}
+	})
+
+	resp, err := http.Get(front.URL + "/ping")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	select {
+	case c := <-got:
+		if v := c.header.Get(ShadowHeader); v != "true" {
+			t.Errorf("%s = %q, want \"true\"", ShadowHeader, v)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("shadow backend never received the mirrored request")
+	}
+}
+
+func TestLoopGuardDropsAlreadyMirroredTraffic(t *testing.T) {
+	for _, header := range loopHeaders {
+		t.Run(header, func(t *testing.T) {
+			mirrored := make(chan struct{}, 1)
+			front := newStack(t, func(w http.ResponseWriter, r *http.Request) {
+				mirrored <- struct{}{}
+			})
+
+			req, _ := http.NewRequest(http.MethodGet, front.URL+"/loop", nil)
+			req.Header.Set(header, "true")
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != http.StatusLoopDetected {
+				t.Errorf("status = %d, want 508", resp.StatusCode)
+			}
+			select {
+			case <-mirrored:
+				t.Error("already-mirrored request was amplified to the shadow backend")
+			case <-time.After(250 * time.Millisecond):
+			}
+		})
+	}
+}
+
 func TestNewShadowRejectsRelativeURL(t *testing.T) {
 	if _, err := NewShadow("shadow.internal"); err == nil {
 		t.Error("expected error for non-absolute shadow URL")
