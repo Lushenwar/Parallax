@@ -7,16 +7,16 @@ No direct commits to `main`. Every change goes: `git checkout -b <branch>` → c
 ## CURRENT STATUS
 
 ╔══════════════════════════════════════════════════════════╗
-║  DASHBOARD BUILD PROGRESS                       1/4 DONE ║
-║  ███████░░░░░░░░░░░░░░░░░░░░░  IN DEVELOPMENT            ║
+║  DASHBOARD BUILD PROGRESS                       2/4 DONE ║
+║  ██████████████░░░░░░░░░░░░░░  IN DEVELOPMENT            ║
 ║  Phase 0: Next.js Setup & Proxy API Client      [DONE]   ║
-║  Phase 1: Real-Time Metrics Overview Cards      [TODO]   ║
+║  Phase 1: Real-Time Metrics Overview Cards      [DONE]   ║
 ║  Phase 2: Dynamic Sampling Rate Control Slider  [TODO]   ║
 ║  Phase 3: Connection & Health Status Monitor    [TODO]   ║
 ╚══════════════════════════════════════════════════════════╝
 
-Phase: 1 — Real-Time Metrics Overview Cards
-Status: Phase 0 complete. Go control plane live; `proxy-client.ts` verified against the running proxy. UI is still the create-next-app default page.
+Phase: 2 — Dynamic Sampling Rate Control Slider
+Status: Phase 1 complete. Dark control-room shell polls `/api/metrics` every 2s and renders six live stat cards. No controls yet — the UI is read-only.
 Update this as you finish each step.
 
 **Dashboard checks:** `cd dashboard && npm test && npm run typecheck && npm run lint`
