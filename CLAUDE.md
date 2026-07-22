@@ -7,16 +7,16 @@ No direct commits to `main`. Every change goes: `git checkout -b <branch>` → c
 ## CURRENT STATUS
 
 ╔══════════════════════════════════════════════════════════╗
-║  DASHBOARD BUILD PROGRESS                       2/4 DONE ║
-║  ██████████████░░░░░░░░░░░░░░  IN DEVELOPMENT            ║
+║  DASHBOARD BUILD PROGRESS                       3/4 DONE ║
+║  █████████████████████░░░░░░░  IN DEVELOPMENT            ║
 ║  Phase 0: Next.js Setup & Proxy API Client      [DONE]   ║
 ║  Phase 1: Real-Time Metrics Overview Cards      [DONE]   ║
-║  Phase 2: Dynamic Sampling Rate Control Slider  [TODO]   ║
+║  Phase 2: Dynamic Sampling Rate Control Slider  [DONE]   ║
 ║  Phase 3: Connection & Health Status Monitor    [TODO]   ║
 ╚══════════════════════════════════════════════════════════╝
 
-Phase: 2 — Dynamic Sampling Rate Control Slider
-Status: Phase 1 complete. Dark control-room shell polls `/api/metrics` every 2s and renders six live stat cards. No controls yet — the UI is read-only.
+Phase: 3 — Connection & Health Status Monitor
+Status: Phase 2 complete. Sample-rate slider and mirroring kill switch write through to the live proxy. Connection loss is not surfaced yet — a dead proxy just leaves dimmed cards.
 Update this as you finish each step.
 
 **Dashboard checks:** `cd dashboard && npm test && npm run typecheck && npm run lint`
