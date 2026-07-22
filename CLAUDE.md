@@ -7,17 +7,17 @@ No direct commits to `main`. Every change goes: `git checkout -b <branch>` → c
 ## CURRENT STATUS
 
 ╔══════════════════════════════════════════════════════════╗
-║  BUILD PROGRESS                                 4/5 DONE ║
-║  ████████████████████░░░░  IN DEVELOPMENT                ║
+║  BUILD PROGRESS                                 5/5 DONE ║
+║  ████████████████████████  MVP COMPLETE                  ║
 ║  Phase 0: Core Reverse Proxy & Request Parsing  [DONE]   ║
 ║  Phase 1: Async Cloning & Payload Buffering     [DONE]   ║
 ║  Phase 2: Target Dispatch & Connection Pooling  [DONE]   ║
 ║  Phase 3: Rate Limiting & Sampling Logic        [DONE]   ║
-║  Phase 4: Metrics, Logging & Load Testing       [TODO]   ║
+║  Phase 4: Metrics, Logging & Load Testing       [DONE]   ║
 ╚══════════════════════════════════════════════════════════╝
 
-Phase: 4 — Metrics, Logging & Load Testing
-Status: Phase 3 complete. Sampling and the bounded worker queue are in; no metrics endpoint yet.
+Phase: MVP complete. All five phases shipped.
+Status: Reverse proxy + bounded buffering + fire-and-forget mirroring + sampling + bounded queue + `/metrics`.
 Update this as you finish each step.
 
 **Run it:** `PRIMARY_URL=http://127.0.0.1:9000 SHADOW_URL=http://127.0.0.1:9001 go run .`
@@ -30,6 +30,28 @@ Update this as you finish each step.
 | `SHADOW_SAMPLE_RATE` | `100` | Percent of traffic to mirror, 0–100 |
 | `SHADOW_QUEUE_SIZE` | `1024` | Bounded dispatch queue depth; full = drop |
 | `SHADOW_WORKERS` | `64` | Goroutines draining the queue |
+| `METRICS_PATH` | `/metrics` | Metrics endpoint; set empty to disable |
+
+**Test it:** `go test ./...` — includes the paused-shadow stress test.
+**Load test it:** `k6 run loadtest/primary_latency.js` (see the header for `hey` and env knobs).
+
+### Source map
+| File | Role |
+|---|---|
+| `main.go` | Wiring: config → primary → shadow middleware → instrumentation → metrics mux |
+| `config.go` | Env-var helpers |
+| `proxy/proxy.go` | Primary reverse proxy, 504 on backend failure |
+| `proxy/transport.go` | Isolated primary/shadow connection pools and timeouts |
+| `proxy/buffer.go` | `MAX_BODY_SIZE` cap, stream-preserving buffering |
+| `proxy/clone.go` | Shadow request construction, header hygiene, Host rewrite |
+| `proxy/shadow.go` | Sampling, loop guard, bounded queue, worker pool, dispatch |
+| `proxy/metrics.go` | expvar counters and the `/metrics` handler |
+| `loadtest/primary_latency.js` | k6 latency budget test |
+
+### Deferred (see `ponytail:` comments in-tree)
+* Latency is a running total, not a histogram — no percentiles from `/metrics`.
+* Graceful shutdown: in-flight mirrors are dropped when the process exits.
+* Sampling is a per-request coin flip, not reproducible per trace ID.
 
 ## WHAT THIS FILE IS
 
