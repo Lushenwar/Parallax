@@ -1,8 +1,36 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useSyncExternalStore } from 'react';
 import { CircleAlert, CircleCheck, CircleSlash, LoaderCircle } from 'lucide-react';
 import { deriveHealth, type HealthInput, type HealthLevel } from '@/lib/health';
+
+/**
+ * A once-per-second clock as an external store.
+ *
+ * The age reading has to advance on its own: when the proxy is down there are
+ * no successful polls to re-render on, and a frozen age during an outage is
+ * exactly the wrong thing to show. useSyncExternalStore rather than an effect
+ * so the snapshot is cached (no cascading render) and SSR gets its own
+ * snapshot instead of a hydration mismatch.
+ */
+let clock = 0;
+
+function subscribeToClock(onChange: () => void): () => void {
+  clock = Date.now();
+  const id = setInterval(() => {
+    clock = Date.now();
+    onChange();
+  }, 1000);
+  return () => clearInterval(id);
+}
+
+function useNow(): number {
+  return useSyncExternalStore(
+    subscribeToClock,
+    () => clock,
+    () => 0, // server render: no wall clock, so no mismatch to hydrate against
+  );
+}
 
 const TONE: Record<HealthLevel, { chip: string; icon: React.ReactNode }> = {
   connecting: {
@@ -24,19 +52,8 @@ const TONE: Record<HealthLevel, { chip: string; icon: React.ReactNode }> = {
 };
 
 export function HealthStatus(props: Omit<HealthInput, 'now'>) {
-  // `now` has to advance on its own: when the proxy is down there are no
-  // successful polls to re-render on, and a frozen "12s ago" during an outage
-  // is exactly the wrong thing to show.
-  const [now, setNow] = useState<number | null>(null);
-  useEffect(() => {
-    setNow(Date.now());
-    const id = setInterval(() => setNow(Date.now()), 1000);
-    return () => clearInterval(id);
-  }, []);
-
-  // Until mounted, `now` is null and the server and client agree on the same
-  // markup — a Date.now() during SSR would mismatch on hydration.
-  const health = deriveHealth({ ...props, now: now ?? props.lastUpdatedAt ?? 0 });
+  const now = useNow();
+  const health = deriveHealth({ ...props, now: now || (props.lastUpdatedAt ?? 0) });
   const tone = TONE[health.level];
 
   return (
@@ -56,7 +73,9 @@ export function HealthStatus(props: Omit<HealthInput, 'now'>) {
 /** Full-width banner for the case where the operator must not mistake stale
  *  numbers for live ones. */
 export function HealthBanner(props: Omit<HealthInput, 'now'>) {
-  const health = deriveHealth({ ...props, now: Date.now() });
+  // No live clock here: the banner's level and copy do not depend on elapsed
+  // time, only the chip's freshness reading does. Keeps render pure.
+  const health = deriveHealth({ ...props, now: props.lastUpdatedAt ?? 0 });
   if (health.level === 'connected' || health.level === 'connecting') return null;
 
   const danger = health.level === 'down';
