@@ -35,7 +35,7 @@ func newStack(t *testing.T, shadowHandler http.HandlerFunc) *httptest.Server {
 	if err != nil {
 		t.Fatal(err)
 	}
-	shadow, err := NewShadow(shadowBackend.URL)
+	shadow, err := NewShadow(shadowBackend.URL, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,7 +101,7 @@ func TestPrimaryUnaffectedWhenShadowIsDown(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	shadow, err := NewShadow(deadURL)
+	shadow, err := NewShadow(deadURL, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -171,7 +171,49 @@ func TestLoopGuardDropsAlreadyMirroredTraffic(t *testing.T) {
 }
 
 func TestNewShadowRejectsRelativeURL(t *testing.T) {
-	if _, err := NewShadow("shadow.internal"); err == nil {
+	if _, err := NewShadow("shadow.internal", 100); err == nil {
 		t.Error("expected error for non-absolute shadow URL")
+	}
+}
+
+func TestNewShadowRejectsOutOfRangeSampleRate(t *testing.T) {
+	for _, rate := range []float64{-1, 100.5} {
+		if _, err := NewShadow("http://shadow.internal", rate); err == nil {
+			t.Errorf("expected error for sample rate %v", rate)
+		}
+	}
+}
+
+func TestSampleRateBoundsAreAbsolute(t *testing.T) {
+	off := &Shadow{SampleRate: 0}
+	on := &Shadow{SampleRate: 100}
+	for i := 0; i < 1000; i++ {
+		if off.sampled() {
+			t.Fatal("sample rate 0 mirrored a request")
+		}
+		if !on.sampled() {
+			t.Fatal("sample rate 100 skipped a request")
+		}
+	}
+}
+
+func TestSamplingApproximatesTheConfiguredRate(t *testing.T) {
+	const (
+		n         = 20000
+		rate      = 25.0
+		tolerance = 3.0 // percentage points; ~8 sigma at n=20000
+	)
+	s := &Shadow{SampleRate: rate}
+
+	hits := 0
+	for i := 0; i < n; i++ {
+		if s.sampled() {
+			hits++
+		}
+	}
+
+	got := float64(hits) / n * 100
+	if got < rate-tolerance || got > rate+tolerance {
+		t.Errorf("sampled %.2f%% of %d requests, want %.0f%% +/- %.0f", got, n, rate, tolerance)
 	}
 }
