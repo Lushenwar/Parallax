@@ -15,12 +15,13 @@ var (
 	PrimaryLatencyMicros = expvar.NewInt("primary_latency_us_total")
 	PrimaryInFlight      = expvar.NewInt("primary_in_flight")
 
-	ShadowDispatched = expvar.NewInt("shadow_dispatched_total")
-	ShadowDropped    = expvar.NewInt("shadow_dropped_total") // queue was full
-	ShadowErrors     = expvar.NewInt("shadow_errors_total")
-	ShadowUnsampled  = expvar.NewInt("shadow_unsampled_total")
-	ShadowTooLarge   = expvar.NewInt("shadow_too_large_total")
-	ShadowLoops      = expvar.NewInt("shadow_loops_blocked_total")
+	ShadowDispatched    = expvar.NewInt("shadow_dispatched_total")
+	ShadowDropped       = expvar.NewInt("shadow_dropped_total") // queue was full
+	ShadowErrors        = expvar.NewInt("shadow_errors_total")
+	ShadowUnsampled     = expvar.NewInt("shadow_unsampled_total")
+	ShadowTooLarge      = expvar.NewInt("shadow_too_large_total")
+	ShadowLoops         = expvar.NewInt("shadow_loops_blocked_total")
+	ShadowLatencyMicros = expvar.NewInt("shadow_latency_us_total")
 )
 
 // MetricsHandler serves the expvar registry as JSON.
