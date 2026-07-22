@@ -4,6 +4,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -35,7 +36,7 @@ func newStack(t *testing.T, shadowHandler http.HandlerFunc) *httptest.Server {
 	if err != nil {
 		t.Fatal(err)
 	}
-	shadow, err := NewShadow(shadowBackend.URL, 100)
+	shadow, err := NewShadow(shadowBackend.URL, 100, 16, 4)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,7 +102,7 @@ func TestPrimaryUnaffectedWhenShadowIsDown(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	shadow, err := NewShadow(deadURL, 100)
+	shadow, err := NewShadow(deadURL, 100, 16, 4)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -171,16 +172,42 @@ func TestLoopGuardDropsAlreadyMirroredTraffic(t *testing.T) {
 }
 
 func TestNewShadowRejectsRelativeURL(t *testing.T) {
-	if _, err := NewShadow("shadow.internal", 100); err == nil {
+	if _, err := NewShadow("shadow.internal", 100, 16, 4); err == nil {
 		t.Error("expected error for non-absolute shadow URL")
 	}
 }
 
 func TestNewShadowRejectsOutOfRangeSampleRate(t *testing.T) {
 	for _, rate := range []float64{-1, 100.5} {
-		if _, err := NewShadow("http://shadow.internal", rate); err == nil {
+		if _, err := NewShadow("http://shadow.internal", rate, 16, 4); err == nil {
 			t.Errorf("expected error for sample rate %v", rate)
 		}
+	}
+}
+
+func TestDispatchDropsInsteadOfBlockingWhenQueueIsFull(t *testing.T) {
+	const capacity = 2
+	target, _ := url.Parse("http://shadow.internal")
+	// No workers: nothing ever drains the queue, so it fills on the third send.
+	s := &Shadow{Target: target, Client: ShadowClient, SampleRate: 100, queue: make(chan *http.Request, capacity)}
+
+	r := httptest.NewRequest(http.MethodPost, "/burst", nil)
+	done := make(chan struct{})
+	go func() {
+		for i := 0; i < 100; i++ {
+			s.Dispatch(r, []byte("payload"))
+		}
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Dispatch blocked on a full queue — this would stall the primary path")
+	}
+
+	if got := len(s.queue); got != capacity {
+		t.Errorf("queued %d requests, want %d (the rest must be dropped)", got, capacity)
 	}
 }
 
