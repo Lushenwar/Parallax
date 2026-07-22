@@ -20,9 +20,20 @@ func main() {
 		log.Fatalf("PRIMARY_URL: %v", err)
 	}
 
+	var handler http.Handler = primary
+	shadowURL := env("SHADOW_URL", "")
+	if shadowURL != "" {
+		shadow, err := proxy.NewShadow(shadowURL)
+		if err != nil {
+			log.Fatalf("SHADOW_URL: %v", err)
+		}
+		handler = shadow.Middleware(primary)
+		log.Printf("mirroring to shadow %s", shadowURL)
+	}
+
 	srv := &http.Server{
 		Addr:    addr,
-		Handler: primary,
+		Handler: handler,
 		// ponytail: no WriteTimeout — it would cap slow primary responses mid-stream.
 		ReadHeaderTimeout: 10 * time.Second,
 	}
