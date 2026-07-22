@@ -7,21 +7,29 @@ No direct commits to `main`. Every change goes: `git checkout -b <branch>` → c
 ## CURRENT STATUS
 
 ╔══════════════════════════════════════════════════════════╗
-║  BUILD PROGRESS                                 3/5 DONE ║
-║  ███████████████░░░░░░░░░  IN DEVELOPMENT                ║
+║  BUILD PROGRESS                                 4/5 DONE ║
+║  ████████████████████░░░░  IN DEVELOPMENT                ║
 ║  Phase 0: Core Reverse Proxy & Request Parsing  [DONE]   ║
 ║  Phase 1: Async Cloning & Payload Buffering     [DONE]   ║
 ║  Phase 2: Target Dispatch & Connection Pooling  [DONE]   ║
-║  Phase 3: Rate Limiting & Sampling Logic        [TODO]   ║
+║  Phase 3: Rate Limiting & Sampling Logic        [DONE]   ║
 ║  Phase 4: Metrics, Logging & Load Testing       [TODO]   ║
 ╚══════════════════════════════════════════════════════════╝
 
-Phase: 3 — Rate Limiting & Sampling Logic
-Status: Phase 2 complete. Traffic mirrors to the shadow backend fire-and-forget; every request is mirrored (no sampling yet).
+Phase: 4 — Metrics, Logging & Load Testing
+Status: Phase 3 complete. Sampling and the bounded worker queue are in; no metrics endpoint yet.
 Update this as you finish each step.
 
 **Run it:** `PRIMARY_URL=http://127.0.0.1:9000 SHADOW_URL=http://127.0.0.1:9001 go run .`
-Listens on `:8080` (`LISTEN_ADDR`). Omit `SHADOW_URL` to run as a plain reverse proxy.
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `LISTEN_ADDR` | `:8080` | Address the proxy listens on |
+| `PRIMARY_URL` | *(required)* | Production backend |
+| `SHADOW_URL` | *(unset)* | Shadow backend; unset = plain reverse proxy |
+| `SHADOW_SAMPLE_RATE` | `100` | Percent of traffic to mirror, 0–100 |
+| `SHADOW_QUEUE_SIZE` | `1024` | Bounded dispatch queue depth; full = drop |
+| `SHADOW_WORKERS` | `64` | Goroutines draining the queue |
 
 ## WHAT THIS FILE IS
 
