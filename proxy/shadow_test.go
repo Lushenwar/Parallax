@@ -189,7 +189,7 @@ func TestDispatchDropsInsteadOfBlockingWhenQueueIsFull(t *testing.T) {
 	const capacity = 2
 	target, _ := url.Parse("http://shadow.internal")
 	// No workers: nothing ever drains the queue, so it fills on the third send.
-	s := &Shadow{Target: target, Client: ShadowClient, SampleRate: 100, queue: make(chan *http.Request, capacity)}
+	s := newTestShadow(target, 100, capacity)
 
 	r := httptest.NewRequest(http.MethodPost, "/burst", nil)
 	done := make(chan struct{})
@@ -211,9 +211,18 @@ func TestDispatchDropsInsteadOfBlockingWhenQueueIsFull(t *testing.T) {
 	}
 }
 
+// newTestShadow builds a Shadow with no workers, so the queue only drains when
+// a test wants it to.
+func newTestShadow(target *url.URL, rate float64, capacity int) *Shadow {
+	s := &Shadow{Target: target, Client: ShadowClient, queue: make(chan *http.Request, capacity)}
+	s.SetSampleRate(rate)
+	s.SetEnabled(true)
+	return s
+}
+
 func TestSampleRateBoundsAreAbsolute(t *testing.T) {
-	off := &Shadow{SampleRate: 0}
-	on := &Shadow{SampleRate: 100}
+	off := newTestShadow(nil, 0, 1)
+	on := newTestShadow(nil, 100, 1)
 	for i := 0; i < 1000; i++ {
 		if off.sampled() {
 			t.Fatal("sample rate 0 mirrored a request")
@@ -230,7 +239,7 @@ func TestSamplingApproximatesTheConfiguredRate(t *testing.T) {
 		rate      = 25.0
 		tolerance = 3.0 // percentage points; ~8 sigma at n=20000
 	)
-	s := &Shadow{SampleRate: rate}
+	s := newTestShadow(nil, rate, 1)
 
 	hits := 0
 	for i := 0; i < n; i++ {

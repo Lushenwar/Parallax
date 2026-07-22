@@ -4,9 +4,12 @@ import (
 	"errors"
 	"io"
 	"log"
+	"math"
 	"math/rand/v2"
 	"net/http"
 	"net/url"
+	"sync/atomic"
+	"time"
 )
 
 // ShadowHeader marks mirrored traffic so a shadow backend can tell it apart.
@@ -18,14 +21,23 @@ const ShadowHeader = "X-Shadow-Traffic"
 // (danger zone #4). CLAUDE.md names the header both ways, so honour both.
 var loopHeaders = []string{ShadowHeader, "X-Shadow-Request"}
 
+// sampleScale is how many atomic units make up one percent. Storing the rate as
+// a scaled integer keeps it atomically mutable from the control plane without
+// float bit-twiddling; the cost is a floor of 0.01% granularity.
+const sampleScale = 100
+
 // Shadow mirrors requests to a secondary backend. Every dispatch is
 // fire-and-forget: nothing here may ever block the primary request path.
+//
+// Must be used by pointer: it carries atomics that the control plane writes
+// while requests are being served.
 type Shadow struct {
 	Target *url.URL
 	Client *http.Client
 
-	// SampleRate is the percentage of traffic to mirror, 0 to 100.
-	SampleRate float64
+	// sampleUnits is the mirror rate in hundredths of a percent, 0..10000.
+	sampleUnits atomic.Int64
+	enabled     atomic.Bool
 
 	// queue is the bounded handoff to the worker pool. Full queue means drop.
 	queue chan *http.Request
@@ -42,24 +54,53 @@ func NewShadow(shadowURL string, sampleRate float64, queueSize, workers int) (*S
 	if target.Scheme == "" || target.Host == "" {
 		return nil, errors.New("shadow URL must be absolute, e.g. http://127.0.0.1:9001")
 	}
-	if sampleRate < 0 || sampleRate > 100 {
-		return nil, errors.New("shadow sample rate must be between 0 and 100")
+	if err := validSampleRate(sampleRate); err != nil {
+		return nil, err
 	}
 	if queueSize < 1 || workers < 1 {
 		return nil, errors.New("shadow queue size and worker count must be at least 1")
 	}
 
 	s := &Shadow{
-		Target:     target,
-		Client:     ShadowClient,
-		SampleRate: sampleRate,
-		queue:      make(chan *http.Request, queueSize),
+		Target: target,
+		Client: ShadowClient,
+		queue:  make(chan *http.Request, queueSize),
 	}
+	s.SetSampleRate(sampleRate)
+	s.SetEnabled(true)
+
 	for i := 0; i < workers; i++ {
 		go s.worker()
 	}
 	return s, nil
 }
+
+func validSampleRate(rate float64) error {
+	if math.IsNaN(rate) || rate < 0 || rate > 100 {
+		return errors.New("shadow sample rate must be between 0 and 100")
+	}
+	return nil
+}
+
+// SampleRate is the percentage of traffic currently being mirrored.
+func (s *Shadow) SampleRate() float64 {
+	return float64(s.sampleUnits.Load()) / sampleScale
+}
+
+// SetSampleRate retunes mirroring live. Out-of-range values are clamped rather
+// than rejected; callers that need rejection validate first.
+func (s *Shadow) SetSampleRate(rate float64) {
+	s.sampleUnits.Store(int64(math.Round(math.Min(math.Max(rate, 0), 100) * sampleScale)))
+}
+
+// Enabled reports whether mirroring is currently on.
+func (s *Shadow) Enabled() bool { return s.enabled.Load() }
+
+// SetEnabled turns mirroring on or off without restarting the proxy.
+func (s *Shadow) SetEnabled(on bool) { s.enabled.Store(on) }
+
+// QueueDepth is the number of clones waiting for a worker.
+func (s *Shadow) QueueDepth() int { return len(s.queue) }
 
 // Middleware mirrors qualifying requests and hands the original to next. The
 // mirror is prepared before next runs because next may mutate the request, and
@@ -113,11 +154,6 @@ func (s *Shadow) Dispatch(r *http.Request, body []byte) {
 	}
 }
 
-// QueueDepth is the number of clones waiting for a worker. Publish it as a
-// gauge if you want it in /metrics; it is not registered here because a process
-// may hold more than one Shadow and expvar names must be unique.
-func (s *Shadow) QueueDepth() int { return len(s.queue) }
-
 func (s *Shadow) worker() {
 	for req := range s.queue {
 		s.send(req)
@@ -125,6 +161,7 @@ func (s *Shadow) worker() {
 }
 
 func (s *Shadow) send(req *http.Request) {
+	start := time.Now()
 	resp, err := s.Client.Do(req)
 	if err != nil {
 		ShadowErrors.Add(1)
@@ -132,6 +169,8 @@ func (s *Shadow) send(req *http.Request) {
 	}
 	defer resp.Body.Close()
 	io.Copy(io.Discard, resp.Body) // Drain so the connection returns to the pool.
+
+	ShadowLatencyMicros.Add(time.Since(start).Microseconds())
 	ShadowDispatched.Add(1)
 }
 
@@ -142,13 +181,17 @@ func (s *Shadow) send(req *http.Request) {
 // in a repeating pattern. Swap in a deterministic hash of a request ID if
 // mirroring needs to be reproducible.
 func (s *Shadow) sampled() bool {
-	switch {
-	case s.SampleRate <= 0:
+	if !s.enabled.Load() {
 		return false
-	case s.SampleRate >= 100:
+	}
+	units := s.sampleUnits.Load()
+	switch {
+	case units <= 0:
+		return false
+	case units >= 100*sampleScale:
 		return true
 	default:
-		return rand.Float64()*100 < s.SampleRate
+		return rand.Int64N(100*sampleScale) < units
 	}
 }
 
