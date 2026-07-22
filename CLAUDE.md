@@ -7,17 +7,17 @@ No direct commits to `main`. Every change goes: `git checkout -b <branch>` → c
 ## CURRENT STATUS
 
 ╔══════════════════════════════════════════════════════════╗
-║  BUILD PROGRESS                                 1/5 DONE ║
-║  █████░░░░░░░░░░░░░░░░░░░  IN DEVELOPMENT                ║
+║  BUILD PROGRESS                                 2/5 DONE ║
+║  ██████████░░░░░░░░░░░░░░  IN DEVELOPMENT                ║
 ║  Phase 0: Core Reverse Proxy & Request Parsing  [DONE]   ║
-║  Phase 1: Async Cloning & Payload Buffering     [TODO]   ║
+║  Phase 1: Async Cloning & Payload Buffering     [DONE]   ║
 ║  Phase 2: Target Dispatch & Connection Pooling  [TODO]   ║
 ║  Phase 3: Rate Limiting & Sampling Logic        [TODO]   ║
 ║  Phase 4: Metrics, Logging & Load Testing       [TODO]   ║
 ╚══════════════════════════════════════════════════════════╝
 
-Phase: 1 — Async Cloning & Payload Buffering
-Status: Phase 0 complete. Proxy streams traffic to the primary backend.
+Phase: 2 — Target Dispatch & Connection Pooling
+Status: Phase 1 complete. Bodies buffer under a 10MB cap and clone cleanly; nothing dispatches yet.
 Update this as you finish each step.
 
 **Run it:** `PRIMARY_URL=http://127.0.0.1:9000 go run .` (listens on `:8080`, override with `LISTEN_ADDR`).
