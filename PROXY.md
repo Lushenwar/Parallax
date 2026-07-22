@@ -32,7 +32,8 @@ Update this as you finish each step.
 | `SHADOW_WORKERS` | `64` | Goroutines draining the queue |
 | `METRICS_PATH` | `/metrics` | Metrics endpoint; set empty to disable |
 
-**Test it:** `go test ./...` — includes the paused-shadow stress test.
+**Test it:** `go test ./proxy/...` — includes the paused-shadow stress test.
+(Scoped to `./proxy/...` because `./...` also walks a vendored Go package inside `dashboard/node_modules`.)
 **Load test it:** `k6 run loadtest/primary_latency.js` (see the header for `hey` and env knobs).
 
 ### Source map

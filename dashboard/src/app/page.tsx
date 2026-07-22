@@ -2,6 +2,7 @@
 
 import { useCallback } from 'react';
 import { ControlPanel } from '@/components/ControlPanel';
+import { HealthBanner, HealthStatus } from '@/components/HealthStatus';
 import { MetricsGrid } from '@/components/MetricsGrid';
 import { fetchConfig, fetchMetrics, updateConfig, type ProxyConfig } from '@/lib/proxy-client';
 import { usePoll } from '@/lib/use-poll';
@@ -24,6 +25,15 @@ export default function DashboardPage() {
     [setConfig],
   );
 
+  // Metrics is the health signal: it polls on the same interval and is the
+  // read the operator is actually watching.
+  const health = {
+    loading: metrics.loading,
+    error: metrics.error,
+    hasData: metrics.data !== null,
+    lastUpdatedAt: metrics.lastUpdatedAt,
+  };
+
   return (
     <main className="mx-auto max-w-7xl space-y-8 p-6">
       <header className="flex flex-wrap items-end justify-between gap-4 border-b border-border pb-4">
@@ -33,9 +43,12 @@ export default function DashboardPage() {
             Live counters from the proxy, refreshed every {POLL_MS / 1000}s.
           </p>
         </div>
+        <HealthStatus {...health} />
       </header>
 
-      {metrics.loading ? (
+      <HealthBanner {...health} />
+
+      {metrics.loading && metrics.data === null ? (
         <p className="py-16 text-center text-muted">Connecting to Shadow Proxy Engine…</p>
       ) : (
         <MetricsGrid metrics={metrics.data} stale={metrics.error !== null} />

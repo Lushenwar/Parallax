@@ -7,19 +7,37 @@ No direct commits to `main`. Every change goes: `git checkout -b <branch>` → c
 ## CURRENT STATUS
 
 ╔══════════════════════════════════════════════════════════╗
-║  DASHBOARD BUILD PROGRESS                       3/4 DONE ║
-║  █████████████████████░░░░░░░  IN DEVELOPMENT            ║
+║  DASHBOARD BUILD PROGRESS                       4/4 DONE ║
+║  ████████████████████████████  COMPLETE                  ║
 ║  Phase 0: Next.js Setup & Proxy API Client      [DONE]   ║
 ║  Phase 1: Real-Time Metrics Overview Cards      [DONE]   ║
 ║  Phase 2: Dynamic Sampling Rate Control Slider  [DONE]   ║
-║  Phase 3: Connection & Health Status Monitor    [TODO]   ║
+║  Phase 3: Connection & Health Status Monitor    [DONE]   ║
 ╚══════════════════════════════════════════════════════════╝
 
-Phase: 3 — Connection & Health Status Monitor
-Status: Phase 2 complete. Sample-rate slider and mirroring kill switch write through to the live proxy. Connection loss is not surfaced yet — a dead proxy just leaves dimmed cards.
+Phase: Complete. All four dashboard phases shipped.
+Status: Live metrics, live controls, and honest connection health. Both halves of Parallax are done.
 Update this as you finish each step.
 
-**Dashboard checks:** `cd dashboard && npm test && npm run typecheck && npm run lint`
+**Dashboard checks:** `cd dashboard && npm test && npm run typecheck && npm run lint && npm run build`
+
+### Dashboard source map
+| File | Role |
+|---|---|
+| `src/app/layout.tsx` | Dark shell and navbar |
+| `src/app/page.tsx` | Polls metrics + config, owns the write path |
+| `src/components/MetricsGrid.tsx` | Six live stat cards |
+| `src/components/ControlPanel.tsx` | Sample-rate slider, mirroring kill switch |
+| `src/components/HealthStatus.tsx` | Header chip + stale-data banner |
+| `src/lib/proxy-client.ts` | Typed, timeout-bounded fetch wrapper |
+| `src/lib/use-poll.ts` | Interval polling with in-flight guard |
+| `src/lib/health.ts` | Pure connection-health derivation (unit tested) |
+
+### Deferred
+* Latency is a lifetime running mean, not windowed — a spike will not show as one. Needs a ring buffer, or histograms on the Go side.
+* No auth on `/api/config`. CORS is pinned to one origin, but anything that can reach the port can retune the proxy. Fine on a private port, not on a public one.
+* No charts or history: every number is an instantaneous read.
+* `maxBodySizeMB` is reported but not editable — it is a compile-time constant in the Go engine.
 
 ## WHAT THIS FILE IS
 
