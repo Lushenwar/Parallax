@@ -4,6 +4,7 @@ import (
 	"errors"
 	"io"
 	"log"
+	"math/rand/v2"
 	"net/http"
 	"net/url"
 )
@@ -22,10 +23,18 @@ var loopHeaders = []string{ShadowHeader, "X-Shadow-Request"}
 type Shadow struct {
 	Target *url.URL
 	Client *http.Client
+
+	// SampleRate is the percentage of traffic to mirror, 0 to 100.
+	SampleRate float64
+
+	// queue is the bounded handoff to the worker pool. Full queue means drop.
+	queue chan *http.Request
 }
 
-// NewShadow returns a mirror aimed at shadowURL.
-func NewShadow(shadowURL string) (*Shadow, error) {
+// NewShadow returns a mirror aimed at shadowURL, sampling sampleRate percent of
+// traffic through a queue of queueSize served by workers goroutines. The
+// workers start immediately and run for the life of the process.
+func NewShadow(shadowURL string, sampleRate float64, queueSize, workers int) (*Shadow, error) {
 	target, err := url.Parse(shadowURL)
 	if err != nil {
 		return nil, err
@@ -33,13 +42,29 @@ func NewShadow(shadowURL string) (*Shadow, error) {
 	if target.Scheme == "" || target.Host == "" {
 		return nil, errors.New("shadow URL must be absolute, e.g. http://127.0.0.1:9001")
 	}
-	return &Shadow{Target: target, Client: ShadowClient}, nil
+	if sampleRate < 0 || sampleRate > 100 {
+		return nil, errors.New("shadow sample rate must be between 0 and 100")
+	}
+	if queueSize < 1 || workers < 1 {
+		return nil, errors.New("shadow queue size and worker count must be at least 1")
+	}
+
+	s := &Shadow{
+		Target:     target,
+		Client:     ShadowClient,
+		SampleRate: sampleRate,
+		queue:      make(chan *http.Request, queueSize),
+	}
+	for i := 0; i < workers; i++ {
+		go s.worker()
+	}
+	return s, nil
 }
 
-// Middleware buffers the request body, mirrors a clone of it, then hands the
-// original to next. The mirror is dispatched before next runs because next may
-// mutate the request, and it is dispatched asynchronously so the primary
-// response never waits on the shadow backend (danger zone #1).
+// Middleware mirrors qualifying requests and hands the original to next. The
+// mirror is prepared before next runs because next may mutate the request, and
+// handed off asynchronously so the primary response never waits on the shadow
+// backend (danger zone #1).
 func (s *Shadow) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if isMirrored(r) {
@@ -48,17 +73,20 @@ func (s *Shadow) Middleware(next http.Handler) http.Handler {
 			return
 		}
 
-		body, err := BufferBody(r)
-		if err == nil {
-			s.Dispatch(r, body)
+		// Sample before buffering: unsampled requests never pay the copy.
+		if s.sampled() {
+			// Over-limit and unreadable bodies still go to the primary, unmirrored.
+			if body, err := BufferBody(r); err == nil {
+				s.Dispatch(r, body)
+			}
 		}
-		// Over-limit and unreadable bodies still go to the primary, unmirrored.
 		next.ServeHTTP(w, r)
 	})
 }
 
-// Dispatch clones r and sends it to the shadow backend on its own goroutine.
-// It returns immediately.
+// Dispatch clones r and hands it to the worker pool. It never blocks: if the
+// queue is full the mirror is dropped, because waiting for shadow capacity
+// would put the shadow backend's latency on the primary path (backpressure rule).
 func (s *Shadow) Dispatch(r *http.Request, body []byte) {
 	req, err := CloneForShadow(r, s.Target, body)
 	if err != nil {
@@ -66,16 +94,17 @@ func (s *Shadow) Dispatch(r *http.Request, body []byte) {
 		return
 	}
 	req.Header.Set(ShadowHeader, "true")
-	go s.send(req)
+
+	select {
+	case s.queue <- req:
+	default: // Queue full — drop silently.
+	}
 }
 
-func isMirrored(r *http.Request) bool {
-	for _, h := range loopHeaders {
-		if r.Header.Get(h) != "" {
-			return true
-		}
+func (s *Shadow) worker() {
+	for req := range s.queue {
+		s.send(req)
 	}
-	return false
 }
 
 func (s *Shadow) send(req *http.Request) {
@@ -85,4 +114,30 @@ func (s *Shadow) send(req *http.Request) {
 	}
 	defer resp.Body.Close()
 	io.Copy(io.Discard, resp.Body) // Drain so the connection returns to the pool.
+}
+
+// sampled reports whether this request is one of the mirrored ones.
+//
+// ponytail: independent per-request coin flip, not a counter-based every-Nth
+// scheme. Statistically equivalent at volume and immune to traffic that arrives
+// in a repeating pattern. Swap in a deterministic hash of a request ID if
+// mirroring needs to be reproducible.
+func (s *Shadow) sampled() bool {
+	switch {
+	case s.SampleRate <= 0:
+		return false
+	case s.SampleRate >= 100:
+		return true
+	default:
+		return rand.Float64()*100 < s.SampleRate
+	}
+}
+
+func isMirrored(r *http.Request) bool {
+	for _, h := range loopHeaders {
+		if r.Header.Get(h) != "" {
+			return true
+		}
+	}
+	return false
 }

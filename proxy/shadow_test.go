@@ -4,6 +4,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -35,7 +36,7 @@ func newStack(t *testing.T, shadowHandler http.HandlerFunc) *httptest.Server {
 	if err != nil {
 		t.Fatal(err)
 	}
-	shadow, err := NewShadow(shadowBackend.URL)
+	shadow, err := NewShadow(shadowBackend.URL, 100, 16, 4)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,7 +102,7 @@ func TestPrimaryUnaffectedWhenShadowIsDown(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	shadow, err := NewShadow(deadURL)
+	shadow, err := NewShadow(deadURL, 100, 16, 4)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -171,7 +172,75 @@ func TestLoopGuardDropsAlreadyMirroredTraffic(t *testing.T) {
 }
 
 func TestNewShadowRejectsRelativeURL(t *testing.T) {
-	if _, err := NewShadow("shadow.internal"); err == nil {
+	if _, err := NewShadow("shadow.internal", 100, 16, 4); err == nil {
 		t.Error("expected error for non-absolute shadow URL")
+	}
+}
+
+func TestNewShadowRejectsOutOfRangeSampleRate(t *testing.T) {
+	for _, rate := range []float64{-1, 100.5} {
+		if _, err := NewShadow("http://shadow.internal", rate, 16, 4); err == nil {
+			t.Errorf("expected error for sample rate %v", rate)
+		}
+	}
+}
+
+func TestDispatchDropsInsteadOfBlockingWhenQueueIsFull(t *testing.T) {
+	const capacity = 2
+	target, _ := url.Parse("http://shadow.internal")
+	// No workers: nothing ever drains the queue, so it fills on the third send.
+	s := &Shadow{Target: target, Client: ShadowClient, SampleRate: 100, queue: make(chan *http.Request, capacity)}
+
+	r := httptest.NewRequest(http.MethodPost, "/burst", nil)
+	done := make(chan struct{})
+	go func() {
+		for i := 0; i < 100; i++ {
+			s.Dispatch(r, []byte("payload"))
+		}
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Dispatch blocked on a full queue — this would stall the primary path")
+	}
+
+	if got := len(s.queue); got != capacity {
+		t.Errorf("queued %d requests, want %d (the rest must be dropped)", got, capacity)
+	}
+}
+
+func TestSampleRateBoundsAreAbsolute(t *testing.T) {
+	off := &Shadow{SampleRate: 0}
+	on := &Shadow{SampleRate: 100}
+	for i := 0; i < 1000; i++ {
+		if off.sampled() {
+			t.Fatal("sample rate 0 mirrored a request")
+		}
+		if !on.sampled() {
+			t.Fatal("sample rate 100 skipped a request")
+		}
+	}
+}
+
+func TestSamplingApproximatesTheConfiguredRate(t *testing.T) {
+	const (
+		n         = 20000
+		rate      = 25.0
+		tolerance = 3.0 // percentage points; ~8 sigma at n=20000
+	)
+	s := &Shadow{SampleRate: rate}
+
+	hits := 0
+	for i := 0; i < n; i++ {
+		if s.sampled() {
+			hits++
+		}
+	}
+
+	got := float64(hits) / n * 100
+	if got < rate-tolerance || got > rate+tolerance {
+		t.Errorf("sampled %.2f%% of %d requests, want %.0f%% +/- %.0f", got, n, rate, tolerance)
 	}
 }

@@ -23,12 +23,17 @@ func main() {
 	var handler http.Handler = primary
 	shadowURL := env("SHADOW_URL", "")
 	if shadowURL != "" {
-		shadow, err := proxy.NewShadow(shadowURL)
+		sampleRate := envFloat("SHADOW_SAMPLE_RATE", 100)
+		queueSize := envInt("SHADOW_QUEUE_SIZE", 1024)
+		workers := envInt("SHADOW_WORKERS", 64)
+
+		shadow, err := proxy.NewShadow(shadowURL, sampleRate, queueSize, workers)
 		if err != nil {
-			log.Fatalf("SHADOW_URL: %v", err)
+			log.Fatalf("shadow config: %v", err)
 		}
 		handler = shadow.Middleware(primary)
-		log.Printf("mirroring to shadow %s", shadowURL)
+		log.Printf("mirroring %.1f%% of traffic to shadow %s (queue %d, workers %d)",
+			sampleRate, shadowURL, queueSize, workers)
 	}
 
 	srv := &http.Server{
