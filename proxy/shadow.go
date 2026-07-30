@@ -8,6 +8,7 @@ import (
 	"math/rand/v2"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync/atomic"
 	"time"
 )
@@ -26,6 +27,17 @@ var loopHeaders = []string{ShadowHeader, "X-Shadow-Request"}
 // float bit-twiddling; the cost is a floor of 0.01% granularity.
 const sampleScale = 100
 
+// safeMethods is the mirror allowlist a zero-value Shadow uses: the methods
+// that are not supposed to change state.
+//
+// A mirrored write is a real write. If the shadow environment shares anything
+// at all with production — a payment sandbox, a mailer, an SMS gateway, a
+// third-party key, a queue — then mirroring POST /charge charges twice and
+// mirroring DELETE /users/42 deletes twice. Writes are therefore opt-in via
+// SHADOW_METHODS, to be turned on only once the shadow stack is known to be
+// isolated.
+var safeMethods = map[string]bool{http.MethodGet: true, http.MethodHead: true}
+
 // Shadow mirrors requests to a secondary backend. Every dispatch is
 // fire-and-forget: nothing here may ever block the primary request path.
 //
@@ -38,6 +50,12 @@ type Shadow struct {
 	// sampleUnits is the mirror rate in hundredths of a percent, 0..10000.
 	sampleUnits atomic.Int64
 	enabled     atomic.Bool
+
+	// methods is the mirror allowlist, keyed by upper-case HTTP method, with
+	// "*" meaning every method. Written once at startup and read by every
+	// request goroutine after that — unlike sampleUnits and enabled, this is
+	// not safe to retune while serving. nil means safeMethods.
+	methods map[string]bool
 
 	// queue is the bounded handoff to the worker pool. Full queue means drop.
 	queue chan *http.Request
@@ -93,6 +111,33 @@ func (s *Shadow) SetSampleRate(rate float64) {
 	s.sampleUnits.Store(int64(math.Round(math.Min(math.Max(rate, 0), 100) * sampleScale)))
 }
 
+// SetMethods replaces the mirror allowlist. A single "*" mirrors every method,
+// which is only safe when the shadow environment shares no downstream with
+// production. An empty list is rejected rather than silently mirroring nothing.
+//
+// Call it before the proxy starts serving; the list is read without a lock.
+func (s *Shadow) SetMethods(methods []string) error {
+	set := make(map[string]bool, len(methods))
+	for _, m := range methods {
+		if m = strings.ToUpper(strings.TrimSpace(m)); m != "" {
+			set[m] = true
+		}
+	}
+	if len(set) == 0 {
+		return errors.New("shadow method list is empty; use \"*\" to mirror every method")
+	}
+	s.methods = set
+	return nil
+}
+
+// mirrors reports whether requests with this method are eligible for mirroring.
+func (s *Shadow) mirrors(method string) bool {
+	if s.methods == nil {
+		return safeMethods[strings.ToUpper(method)]
+	}
+	return s.methods["*"] || s.methods[strings.ToUpper(method)]
+}
+
 // Enabled reports whether mirroring is currently on.
 func (s *Shadow) Enabled() bool { return s.enabled.Load() }
 
@@ -112,6 +157,14 @@ func (s *Shadow) Middleware(next http.Handler) http.Handler {
 			ShadowLoops.Add(1)
 			log.Printf("loop guard: dropping already-mirrored request %s %s", r.Method, r.URL.Path)
 			http.Error(w, "shadow traffic loop detected", http.StatusLoopDetected)
+			return
+		}
+
+		// Method filter before sampling: a write must never be mirrored, at any
+		// sample rate.
+		if !s.mirrors(r.Method) {
+			ShadowSkippedMethod.Add(1)
+			next.ServeHTTP(w, r)
 			return
 		}
 

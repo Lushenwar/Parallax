@@ -34,6 +34,12 @@ Update this as you finish each step.
 | `src/lib/health.ts` | Pure connection-health derivation (unit tested) |
 
 ### Deferred
+**The comparator.** The shadow response is discarded unread (`io.Copy(io.Discard, ...)` in `proxy/shadow.go`). Parallax mirrors traffic but never reports that the two backends disagree — which is the reason tools like Diffy and Scientist exist. Buffering the primary response, diffing status/headers/JSON body against the shadow's with ignore-paths for nondeterminism, and surfacing mismatches via `/api/diffs` plus a dashboard feed is the next real push. Everything below is support for it.
+
+* Sampling is a per-request coin flip, so mirrored traffic is not trace-coherent. Blocks the comparator: a mirrored `POST /cart/add` without its `POST /login` 401s, producing diffs caused by the sampler rather than by the code under test. Hash a trace/session ID instead.
+* No percentiles (`avgMillis` is a lifetime mean over `totalMicros/count`, and divides before converting, so sub-microsecond precision is dropped). p99 is the number that justifies a proxy in the request path and cannot currently be read at runtime.
+* No proxy-vs-direct overhead measurement, so no specific overhead figure is defensible.
+* No path filtering; `SHADOW_METHODS` is global.
 * Latency is a lifetime running mean, not windowed — a spike will not show as one. Needs a ring buffer, or histograms on the Go side.
 * No auth on `/api/config`. CORS is pinned to one origin, but anything that can reach the port can retune the proxy. Fine on a private port, not on a public one.
 * No charts or history: every number is an instantaneous read.

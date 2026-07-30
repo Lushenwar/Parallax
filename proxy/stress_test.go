@@ -47,6 +47,11 @@ func TestPrimarySurvivesPausedShadow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The load is POSTs; mirror them so this exercises backpressure rather than
+	// the method allowlist.
+	if err := shadow.SetMethods([]string{"*"}); err != nil {
+		t.Fatal(err)
+	}
 
 	front := httptest.NewServer(Instrument(shadow.Middleware(primary)))
 	defer front.Close()
