@@ -4,9 +4,8 @@ An HTTP reverse proxy that mirrors a configurable share of live production traff
 backend, without ever putting that second backend on the client's critical path — plus a Next.js
 control plane for watching and retuning it while it runs.
 
-**Scope:** this is a mirror, not a response comparator. The shadow response is drained and
-discarded unread, so Parallax will not tell you that the two backends disagree. Comparison is the
-next thing to build; see [Known limits](#known-limits).
+Mirrored responses are compared against what the client was actually served, so the point of the
+tool is the diff feed: **which requests the two backends disagreed about, and how.**
 
 * **`/` (Go)** — the proxy engine. Architecture and phase notes: [`PROXY.md`](PROXY.md).
 * **`dashboard/` (Next.js)** — the control plane. Plan and notes: [`CLAUDE.md`](CLAUDE.md).
@@ -22,7 +21,8 @@ Three processes. The defaults already line up, so no configuration is needed for
 go run ./loadtest/backends
 
 # 2 — the proxy, listening on :8080
-PRIMARY_URL=http://127.0.0.1:9000 SHADOW_URL=http://127.0.0.1:9001 go run .
+PRIMARY_URL=http://127.0.0.1:9000 SHADOW_URL=http://127.0.0.1:9001 \
+  DIFF_IGNORE=requestId,servedAt go run .
 
 # 3 — the dashboard, on http://localhost:3000
 cd dashboard && npm install && npm run dev
@@ -31,11 +31,32 @@ cd dashboard && npm install && npm run dev
 Then send traffic at the proxy and watch it in the dashboard:
 
 ```bash
-curl -X POST localhost:8080/orders -H 'Content-Type: application/json' -d '{"qty":2}'
+curl localhost:8080/checkout
 ```
 
 The primary answers you; a copy lands at the shadow backend with `X-Shadow-Traffic: true`, and the
 counters move. Drag the sample rate slider and the mix changes live.
+
+### Catching a regression
+
+The throwaway backends disagree on purpose: the shadow returns `"total": 99` where the primary
+returns `100`. That is what the Response Diffs panel is for.
+
+```console
+$ curl -s localhost:8080/api/diffs
+{"enabled":true,"matches":0,"mismatches":1,"diffs":[{"at":"...","method":"GET",
+ "path":"/checkout","primaryStatus":200,"shadowStatus":200,
+ "reasons":["total: primary 100, shadow 99"]}]}
+```
+
+Both backends also return a `requestId` and `servedAt` that differ on every call. `DIFF_IGNORE`
+is what keeps those out of the feed — drop it from the command above and every request reports
+two false differences alongside the real one. That is the central problem with response
+comparison, and the ignore list is the knob for it.
+
+Comparison covers status code, `Content-Type`, and the response body. JSON bodies are compared
+structurally, so key order and whitespace are not differences; anything else is compared byte for
+byte. Paths in the ignore list use `.` for nesting and `*` for any one segment: `items.*.id`.
 
 ### Configuration
 
@@ -48,6 +69,8 @@ counters move. Drag the sample rate slider and the mix changes live.
 | `SHADOW_METHODS` | `GET,HEAD` | Methods eligible for mirroring; `*` mirrors all. **See the warning below before widening this.** |
 | `SHADOW_QUEUE_SIZE` | `1024` | Bounded dispatch queue depth; full = drop |
 | `SHADOW_WORKERS` | `64` | Goroutines draining the queue |
+| `DIFF_BUFFER` | `100` | Mismatches kept for the dashboard; `0` disables comparison entirely |
+| `DIFF_IGNORE` | *(empty)* | Comma-separated JSON paths whose differences are expected, e.g. `createdAt,items.*.id` |
 | `METRICS_PATH` | `/metrics` | expvar endpoint; empty disables |
 | `DASHBOARD_ORIGIN` | `http://localhost:3000` | Sole allowed CORS origin for `/api/*` |
 | `NEXT_PUBLIC_PROXY_URL` | `http://localhost:8080` | Where the dashboard looks for the proxy |
@@ -99,6 +122,8 @@ Until then, run it locally.
 ## Known limits
 
 * Latency is a lifetime running mean, not windowed — a spike will not show up as one.
+* Comparison holds the primary response in memory until the shadow answers, capped at 1MB. Larger responses are compared up to the cap and flagged as truncated.
+* Only status, `Content-Type` and body are compared. Other headers are ignored as a matter of course — they differ between two backends for reasons that have nothing to do with a regression.
 * SIGTERM drains in-flight primary requests (15s cap); queued mirrors are still dropped, by design.
 * No percentiles. Latency is a lifetime mean, so p95/p99 — the numbers that say whether a proxy in the request path is acceptable — cannot be read from a running process.
 * No measured overhead figure: the load tests show mirroring does not degrade the primary, which is not the same as proxy-vs-direct overhead.

@@ -47,6 +47,16 @@ func main() {
 			log.Fatalf("SHADOW_METHODS: %v", err)
 		}
 
+		// Comparison is the reason the mirror exists, so it is on unless the
+		// operator turns it off with DIFF_BUFFER=0.
+		if diffBuffer := envInt("DIFF_BUFFER", 100); diffBuffer > 0 {
+			ignore := env("DIFF_IGNORE", "")
+			shadow.EnableDiffs(diffBuffer, ignore)
+			log.Printf("comparing responses (keeping %d mismatches, ignoring %q)", diffBuffer, ignore)
+		} else {
+			log.Print("response comparison disabled (DIFF_BUFFER=0); shadow responses are discarded")
+		}
+
 		handler = shadow.Middleware(primary)
 		log.Printf("mirroring %.1f%% of [%s] traffic to shadow %s (queue %d, workers %d)",
 			sampleRate, methods, shadowURL, queueSize, workers)

@@ -15,8 +15,10 @@ No direct commits to `main`. Every change goes: `git checkout -b <branch>` → c
 ║  Phase 3: Connection & Health Status Monitor    [DONE]   ║
 ╚══════════════════════════════════════════════════════════╝
 
-Phase: Complete. All four dashboard phases shipped.
-Status: Live metrics, live controls, and honest connection health. Both halves of Parallax are done.
+Phase: Complete, plus the comparator (`proxy/diff.go`, `proxy/capture.go`, `/api/diffs`, `DiffFeed.tsx`).
+Status: Parallax now compares shadow responses against what the client was served and reports the
+mismatches — it is a response comparator, not just a mirror. Writes are off by default
+(`SHADOW_METHODS`), SIGTERM drains, and CI runs both halves.
 Update this as you finish each step.
 
 **Dashboard checks:** `cd dashboard && npm test && npm run typecheck && npm run lint && npm run build`
@@ -29,14 +31,13 @@ Update this as you finish each step.
 | `src/components/MetricsGrid.tsx` | Six live stat cards |
 | `src/components/ControlPanel.tsx` | Sample-rate slider, mirroring kill switch |
 | `src/components/HealthStatus.tsx` | Header chip + stale-data banner |
+| `src/components/DiffFeed.tsx` | Response-mismatch feed |
 | `src/lib/proxy-client.ts` | Typed, timeout-bounded fetch wrapper |
 | `src/lib/use-poll.ts` | Interval polling with in-flight guard |
 | `src/lib/health.ts` | Pure connection-health derivation (unit tested) |
 
 ### Deferred
-**The comparator.** The shadow response is discarded unread (`io.Copy(io.Discard, ...)` in `proxy/shadow.go`). Parallax mirrors traffic but never reports that the two backends disagree — which is the reason tools like Diffy and Scientist exist. Buffering the primary response, diffing status/headers/JSON body against the shadow's with ignore-paths for nondeterminism, and surfacing mismatches via `/api/diffs` plus a dashboard feed is the next real push. Everything below is support for it.
-
-* Sampling is a per-request coin flip, so mirrored traffic is not trace-coherent. Blocks the comparator: a mirrored `POST /cart/add` without its `POST /login` 401s, producing diffs caused by the sampler rather than by the code under test. Hash a trace/session ID instead.
+* **Sampling is a per-request coin flip, so mirrored traffic is not trace-coherent.** Now the most consequential gap: with the comparator live, a mirrored `POST /cart/add` whose `POST /login` was never mirrored 401s, and the diff feed fills with false positives caused by the sampler rather than by the code under test. Hash a trace/session ID instead of flipping a coin. Only invisible today because the default allowlist is `GET,HEAD`.
 * No percentiles (`avgMillis` is a lifetime mean over `totalMicros/count`, and divides before converting, so sub-microsecond precision is dropped). p99 is the number that justifies a proxy in the request path and cannot currently be read at runtime.
 * No proxy-vs-direct overhead measurement, so no specific overhead figure is defensible.
 * No path filtering; `SHADOW_METHODS` is global.
@@ -96,6 +97,27 @@ The Go proxy exposes the following internal endpoints for the dashboard to consu
        "shadowEnabled": true
      }
      ```
+
+4. **`GET /api/diffs`**
+   * *Returns JSON:*
+     ```json
+     {
+       "enabled": true,
+       "matches": 812,
+       "mismatches": 3,
+       "diffs": [
+         {
+           "at": "2026-07-30T19:40:13Z",
+           "method": "GET",
+           "path": "/checkout",
+           "primaryStatus": 200,
+           "shadowStatus": 200,
+           "reasons": ["total: primary 100, shadow 99"]
+         }
+       ]
+     }
+     ```
+   * `enabled: false` means comparison is off (`DIFF_BUFFER=0`) — distinct from "on and finding nothing".
 
 ### Trust boundary
 `/api/config` mutates a proxy sitting in the live request path. Therefore:

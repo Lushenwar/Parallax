@@ -2,16 +2,21 @@
 
 import { useCallback } from 'react';
 import { ControlPanel } from '@/components/ControlPanel';
+import { DiffFeed } from '@/components/DiffFeed';
 import { HealthBanner, HealthStatus } from '@/components/HealthStatus';
 import { MetricsGrid } from '@/components/MetricsGrid';
-import { fetchConfig, fetchMetrics, updateConfig, type ProxyConfig } from '@/lib/proxy-client';
+import { fetchConfig, fetchDiffs, fetchMetrics, updateConfig, type ProxyConfig } from '@/lib/proxy-client';
 import { usePoll } from '@/lib/use-poll';
 
 const POLL_MS = 2000;
+const DIFF_POLL_MS = 5000;
 
 export default function DashboardPage() {
   const metrics = usePoll(fetchMetrics, POLL_MS);
   const config = usePoll(fetchConfig, POLL_MS);
+  // Diffs are a feed of rare events, not a counter — polling them as fast as
+  // the numbers would mostly re-fetch an unchanged list.
+  const diffs = usePoll(fetchDiffs, DIFF_POLL_MS);
 
   const setConfig = config.set;
   const handleConfigChange = useCallback(
@@ -59,6 +64,8 @@ export default function DashboardPage() {
         onChange={handleConfigChange}
         disabled={config.error !== null}
       />
+
+      <DiffFeed report={diffs.data} stale={diffs.error !== null} />
     </main>
   );
 }

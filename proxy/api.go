@@ -19,6 +19,24 @@ type Metrics struct {
 	AvgShadowLatencyMs       float64 `json:"avgShadowLatencyMs"`
 }
 
+// DiffReport is the comparison view: how many responses agreed, how many did
+// not, and the most recent disagreements.
+//
+// Enabled is what lets the dashboard distinguish "comparison is off" from
+// "comparison is on and has found nothing" — a distinction worth being loud
+// about, since the second is the whole point of the tool and the first looks
+// identical from the outside.
+type DiffReport struct {
+	Enabled    bool   `json:"enabled"`
+	Matches    int64  `json:"matches"`
+	Mismatches int64  `json:"mismatches"`
+	Diffs      []Diff `json:"diffs"`
+}
+
+// maxDiffsReturned caps one /api/diffs response. The store holds more; the
+// dashboard shows a feed, not an archive.
+const maxDiffsReturned = 50
+
 // Config is the live, mutable slice of proxy settings.
 type Config struct {
 	SampleRate    float64 `json:"sampleRate"`
@@ -52,6 +70,12 @@ func APIHandler(shadow *Shadow, allowedOrigin string) http.Handler {
 			return
 		}
 		writeJSON(w, http.StatusOK, currentMetrics())
+	})
+	mux.HandleFunc("/api/diffs", func(w http.ResponseWriter, r *http.Request) {
+		if !cors(w, r, allowedOrigin, http.MethodGet) {
+			return
+		}
+		writeJSON(w, http.StatusOK, currentDiffs(shadow))
 	})
 	mux.HandleFunc("/api/config", func(w http.ResponseWriter, r *http.Request) {
 		if !cors(w, r, allowedOrigin, http.MethodGet, http.MethodPost) {
@@ -90,6 +114,18 @@ func avgMillis(totalMicros, count int64) float64 {
 		return 0
 	}
 	return float64(totalMicros/count) / 1000
+}
+
+func currentDiffs(shadow *Shadow) DiffReport {
+	if shadow == nil || shadow.Diffs() == nil {
+		return DiffReport{Diffs: []Diff{}}
+	}
+	return DiffReport{
+		Enabled:    true,
+		Matches:    DiffMatches.Value(),
+		Mismatches: DiffMismatches.Value(),
+		Diffs:      shadow.Diffs().Recent(maxDiffsReturned),
+	}
 }
 
 func currentConfig(shadow *Shadow) Config {

@@ -219,7 +219,7 @@ func TestDispatchDropsInsteadOfBlockingWhenQueueIsFull(t *testing.T) {
 // newTestShadow builds a Shadow with no workers, so the queue only drains when
 // a test wants it to.
 func newTestShadow(target *url.URL, rate float64, capacity int) *Shadow {
-	s := &Shadow{Target: target, Client: ShadowClient, queue: make(chan *http.Request, capacity)}
+	s := &Shadow{Target: target, Client: ShadowClient, queue: make(chan *mirror, capacity)}
 	s.SetSampleRate(rate)
 	s.SetEnabled(true)
 	return s

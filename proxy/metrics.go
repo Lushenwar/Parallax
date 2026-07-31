@@ -23,6 +23,9 @@ var (
 	ShadowTooLarge      = expvar.NewInt("shadow_too_large_total")
 	ShadowLoops         = expvar.NewInt("shadow_loops_blocked_total")
 	ShadowLatencyMicros = expvar.NewInt("shadow_latency_us_total")
+
+	DiffMatches    = expvar.NewInt("diff_matches_total")
+	DiffMismatches = expvar.NewInt("diff_mismatches_total")
 )
 
 // MetricsHandler serves the expvar registry as JSON.
