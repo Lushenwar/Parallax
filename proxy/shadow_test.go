@@ -40,6 +40,11 @@ func newStack(t *testing.T, shadowHandler http.HandlerFunc) *httptest.Server {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// These tests are about the dispatch path, not the method allowlist, so
+	// mirror writes too — the allowlist has its own test below.
+	if err := shadow.SetMethods([]string{"*"}); err != nil {
+		t.Fatal(err)
+	}
 
 	front := httptest.NewServer(shadow.Middleware(primary))
 	t.Cleanup(front.Close)
@@ -214,10 +219,48 @@ func TestDispatchDropsInsteadOfBlockingWhenQueueIsFull(t *testing.T) {
 // newTestShadow builds a Shadow with no workers, so the queue only drains when
 // a test wants it to.
 func newTestShadow(target *url.URL, rate float64, capacity int) *Shadow {
-	s := &Shadow{Target: target, Client: ShadowClient, queue: make(chan *http.Request, capacity)}
+	s := &Shadow{Target: target, Client: ShadowClient, queue: make(chan *mirror, capacity)}
 	s.SetSampleRate(rate)
 	s.SetEnabled(true)
 	return s
+}
+
+// TestWritesAreNotMirroredByDefault is the guard on the expensive mistake: a
+// mirrored POST is a second real POST against whatever the shadow backend talks
+// to. Default config must let writes through to the primary unmirrored.
+func TestWritesAreNotMirroredByDefault(t *testing.T) {
+	s := newTestShadow(nil, 100, 1) // 100% sampling, default method allowlist
+
+	for _, m := range []string{http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete} {
+		if s.mirrors(m) {
+			t.Errorf("%s is mirrored by default — a mirrored write is a real write", m)
+		}
+	}
+	for _, m := range []string{http.MethodGet, http.MethodHead, "get"} {
+		if !s.mirrors(m) {
+			t.Errorf("%s should be mirrored by default", m)
+		}
+	}
+
+	if err := s.SetMethods([]string{"get", " post "}); err != nil {
+		t.Fatal(err)
+	}
+	if !s.mirrors(http.MethodPost) || !s.mirrors(http.MethodGet) {
+		t.Error("opt-in allowlist did not take effect")
+	}
+	if s.mirrors(http.MethodDelete) {
+		t.Error("DELETE mirrored despite not being in the allowlist")
+	}
+
+	if err := s.SetMethods([]string{"*"}); err != nil {
+		t.Fatal(err)
+	}
+	if !s.mirrors(http.MethodDelete) {
+		t.Error(`"*" should mirror every method`)
+	}
+	if err := s.SetMethods([]string{"", "  "}); err == nil {
+		t.Error("an empty method list should be rejected, not silently mirror nothing")
+	}
 }
 
 func TestSampleRateBoundsAreAbsolute(t *testing.T) {

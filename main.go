@@ -1,9 +1,15 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"expvar"
 	"log"
 	"net/http"
+	"os"
+	"os/signal"
+	"strings"
+	"syscall"
 	"time"
 
 	"github.com/Lushenwar/Parallax/proxy"
@@ -34,9 +40,26 @@ func main() {
 		}
 		expvar.Publish("shadow_queue_depth", expvar.Func(func() any { return shadow.QueueDepth() }))
 
+		// Safe methods only unless the operator says otherwise — a mirrored
+		// write hits the shadow backend for real. "*" mirrors everything.
+		methods := env("SHADOW_METHODS", "GET,HEAD")
+		if err := shadow.SetMethods(strings.Split(methods, ",")); err != nil {
+			log.Fatalf("SHADOW_METHODS: %v", err)
+		}
+
+		// Comparison is the reason the mirror exists, so it is on unless the
+		// operator turns it off with DIFF_BUFFER=0.
+		if diffBuffer := envInt("DIFF_BUFFER", 100); diffBuffer > 0 {
+			ignore := env("DIFF_IGNORE", "")
+			shadow.EnableDiffs(diffBuffer, ignore)
+			log.Printf("comparing responses (keeping %d mismatches, ignoring %q)", diffBuffer, ignore)
+		} else {
+			log.Print("response comparison disabled (DIFF_BUFFER=0); shadow responses are discarded")
+		}
+
 		handler = shadow.Middleware(primary)
-		log.Printf("mirroring %.1f%% of traffic to shadow %s (queue %d, workers %d)",
-			sampleRate, shadowURL, queueSize, workers)
+		log.Printf("mirroring %.1f%% of [%s] traffic to shadow %s (queue %d, workers %d)",
+			sampleRate, methods, shadowURL, queueSize, workers)
 	}
 	handler = proxy.Instrument(handler)
 
@@ -60,6 +83,33 @@ func main() {
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
+	// This process sits in front of a live backend, so exiting the moment the
+	// signal lands would drop client requests mid-flight every time the proxy
+	// itself is redeployed. Drain instead.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatal(err)
+		}
+	}()
 	log.Printf("parallax listening on %s -> primary %s", addr, primaryURL)
-	log.Fatal(srv.ListenAndServe())
+
+	<-ctx.Done()
+	stop() // A second signal now kills the process rather than being swallowed.
+	log.Printf("shutdown: draining in-flight requests (%s)", shutdownGrace)
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
+	defer cancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Printf("shutdown: %v", err)
+	}
+	// ponytail: queued mirrors are still dropped here, deliberately. They are
+	// fire-and-forget by design, and draining them would make shutdown of the
+	// primary path wait on the shadow backend.
+	log.Print("shutdown: complete")
 }
+
+// shutdownGrace bounds the drain so a hung backend cannot block the exit.
+const shutdownGrace = 15 * time.Second

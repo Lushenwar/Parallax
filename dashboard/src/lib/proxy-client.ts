@@ -27,6 +27,26 @@ export interface ProxyConfig {
   shadowEnabled: boolean;
 }
 
+/** One recorded disagreement between the primary and shadow backends. */
+export interface Diff {
+  at: string;
+  method: string;
+  path: string;
+  primaryStatus: number;
+  shadowStatus: number;
+  reasons: string[];
+}
+
+/** The comparison view. `enabled: false` means the proxy is mirroring without
+ *  comparing — worth distinguishing from "comparing and finding nothing",
+ *  because the two look identical from a count of zero. */
+export interface DiffReport {
+  enabled: boolean;
+  matches: number;
+  mismatches: number;
+  diffs: Diff[];
+}
+
 /** Anything that went wrong talking to the proxy. `unreachable` separates
  *  "the proxy is down" from "the proxy said no", which the health monitor
  *  renders differently. */
@@ -78,6 +98,10 @@ async function errorMessage(res: Response): Promise<string> {
 
 export function fetchMetrics(): Promise<ProxyMetrics> {
   return request<ProxyMetrics>('/api/metrics');
+}
+
+export function fetchDiffs(): Promise<DiffReport> {
+  return request<DiffReport>('/api/diffs');
 }
 
 export function fetchConfig(): Promise<ProxyConfig> {

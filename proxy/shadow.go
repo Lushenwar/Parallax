@@ -8,6 +8,7 @@ import (
 	"math/rand/v2"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync/atomic"
 	"time"
 )
@@ -26,6 +27,17 @@ var loopHeaders = []string{ShadowHeader, "X-Shadow-Request"}
 // float bit-twiddling; the cost is a floor of 0.01% granularity.
 const sampleScale = 100
 
+// safeMethods is the mirror allowlist a zero-value Shadow uses: the methods
+// that are not supposed to change state.
+//
+// A mirrored write is a real write. If the shadow environment shares anything
+// at all with production — a payment sandbox, a mailer, an SMS gateway, a
+// third-party key, a queue — then mirroring POST /charge charges twice and
+// mirroring DELETE /users/42 deletes twice. Writes are therefore opt-in via
+// SHADOW_METHODS, to be turned on only once the shadow stack is known to be
+// isolated.
+var safeMethods = map[string]bool{http.MethodGet: true, http.MethodHead: true}
+
 // Shadow mirrors requests to a secondary backend. Every dispatch is
 // fire-and-forget: nothing here may ever block the primary request path.
 //
@@ -39,8 +51,27 @@ type Shadow struct {
 	sampleUnits atomic.Int64
 	enabled     atomic.Bool
 
+	// methods is the mirror allowlist, keyed by upper-case HTTP method, with
+	// "*" meaning every method. Written once at startup and read by every
+	// request goroutine after that — unlike sampleUnits and enabled, this is
+	// not safe to retune while serving. nil means safeMethods.
+	methods map[string]bool
+
 	// queue is the bounded handoff to the worker pool. Full queue means drop.
-	queue chan *http.Request
+	queue chan *mirror
+
+	// diffs is where comparison results land. nil disables comparison entirely,
+	// in which case the shadow response is drained and discarded as before.
+	// Written once at startup, like methods.
+	diffs  *DiffStore
+	ignore ignoreList
+}
+
+// mirror is one queued clone, optionally carrying what the primary answered so
+// the worker can compare the two.
+type mirror struct {
+	req     *http.Request
+	primary *capturedResponse
 }
 
 // NewShadow returns a mirror aimed at shadowURL, sampling sampleRate percent of
@@ -64,7 +95,7 @@ func NewShadow(shadowURL string, sampleRate float64, queueSize, workers int) (*S
 	s := &Shadow{
 		Target: target,
 		Client: ShadowClient,
-		queue:  make(chan *http.Request, queueSize),
+		queue:  make(chan *mirror, queueSize),
 	}
 	s.SetSampleRate(sampleRate)
 	s.SetEnabled(true)
@@ -93,6 +124,49 @@ func (s *Shadow) SetSampleRate(rate float64) {
 	s.sampleUnits.Store(int64(math.Round(math.Min(math.Max(rate, 0), 100) * sampleScale)))
 }
 
+// SetMethods replaces the mirror allowlist. A single "*" mirrors every method,
+// which is only safe when the shadow environment shares no downstream with
+// production. An empty list is rejected rather than silently mirroring nothing.
+//
+// Call it before the proxy starts serving; the list is read without a lock.
+func (s *Shadow) SetMethods(methods []string) error {
+	set := make(map[string]bool, len(methods))
+	for _, m := range methods {
+		if m = strings.ToUpper(strings.TrimSpace(m)); m != "" {
+			set[m] = true
+		}
+	}
+	if len(set) == 0 {
+		return errors.New("shadow method list is empty; use \"*\" to mirror every method")
+	}
+	s.methods = set
+	return nil
+}
+
+// mirrors reports whether requests with this method are eligible for mirroring.
+func (s *Shadow) mirrors(method string) bool {
+	if s.methods == nil {
+		return safeMethods[strings.ToUpper(method)]
+	}
+	return s.methods["*"] || s.methods[strings.ToUpper(method)]
+}
+
+// EnableDiffs turns on response comparison, keeping the most recent limit
+// mismatches. ignorePaths is a comma-separated list of JSON paths whose
+// differences are expected rather than interesting — "data.createdAt",
+// "items.*.id" — where a "*" segment matches any one path segment.
+//
+// Comparison makes the proxy hold the primary response body in memory (capped
+// at MaxCaptureSize) for the life of the mirror, which is why it is opt-in.
+// Call it before the proxy starts serving.
+func (s *Shadow) EnableDiffs(limit int, ignorePaths string) {
+	s.diffs = NewDiffStore(limit)
+	s.ignore = parseIgnoreList(ignorePaths)
+}
+
+// Diffs is the recorded-mismatch store, or nil when comparison is off.
+func (s *Shadow) Diffs() *DiffStore { return s.diffs }
+
 // Enabled reports whether mirroring is currently on.
 func (s *Shadow) Enabled() bool { return s.enabled.Load() }
 
@@ -115,6 +189,14 @@ func (s *Shadow) Middleware(next http.Handler) http.Handler {
 			return
 		}
 
+		// Method filter before sampling: a write must never be mirrored, at any
+		// sample rate.
+		if !s.mirrors(r.Method) {
+			ShadowSkippedMethod.Add(1)
+			next.ServeHTTP(w, r)
+			return
+		}
+
 		// Sample before buffering: unsampled requests never pay the copy.
 		if !s.sampled() {
 			ShadowUnsampled.Add(1)
@@ -123,6 +205,7 @@ func (s *Shadow) Middleware(next http.Handler) http.Handler {
 		}
 
 		// Over-limit and unreadable bodies still go to the primary, unmirrored.
+		var m *mirror
 		body, err := BufferBody(r)
 		switch {
 		case errors.Is(err, ErrPayloadTooLarge):
@@ -130,48 +213,104 @@ func (s *Shadow) Middleware(next http.Handler) http.Handler {
 		case err != nil:
 			log.Printf("shadow buffering failed: %s %s: %v", r.Method, r.URL.Path, err)
 		default:
-			s.Dispatch(r, body)
+			// Clone before next runs, because next may mutate the request.
+			m = s.prepare(r, body)
 		}
-		next.ServeHTTP(w, r)
+
+		// Capture the primary response only when there is a mirror to compare it
+		// against — an unmirrored request should not pay for a buffer nobody reads.
+		if m == nil || s.diffs == nil {
+			next.ServeHTTP(w, r)
+		} else {
+			cw := &captureWriter{ResponseWriter: w}
+			next.ServeHTTP(cw, r)
+			m.primary = cw.captured()
+		}
+
+		// Enqueue after the primary is served: the queue handoff is instant, but
+		// the primary path owes the client nothing behind it.
+		if m != nil {
+			s.enqueue(m)
+		}
 	})
 }
 
-// Dispatch clones r and hands it to the worker pool. It never blocks: if the
-// queue is full the mirror is dropped, because waiting for shadow capacity
-// would put the shadow backend's latency on the primary path (backpressure rule).
+// Dispatch clones r and hands it to the worker pool without comparing
+// responses. It never blocks: if the queue is full the mirror is dropped,
+// because waiting for shadow capacity would put the shadow backend's latency on
+// the primary path (backpressure rule).
 func (s *Shadow) Dispatch(r *http.Request, body []byte) {
+	if m := s.prepare(r, body); m != nil {
+		s.enqueue(m)
+	}
+}
+
+// prepare builds the clone. It returns nil if the request cannot be cloned,
+// which is logged and otherwise ignored — the primary is unaffected either way.
+func (s *Shadow) prepare(r *http.Request, body []byte) *mirror {
 	req, err := CloneForShadow(r, s.Target, body)
 	if err != nil {
 		log.Printf("shadow clone failed: %s %s: %v", r.Method, r.URL.Path, err)
-		return
+		return nil
 	}
 	req.Header.Set(ShadowHeader, "true")
+	return &mirror{req: req}
+}
 
+func (s *Shadow) enqueue(m *mirror) {
 	select {
-	case s.queue <- req:
+	case s.queue <- m:
 	default:
 		ShadowDropped.Add(1) // Queue full — drop silently, counted only.
 	}
 }
 
 func (s *Shadow) worker() {
-	for req := range s.queue {
-		s.send(req)
+	for m := range s.queue {
+		s.send(m)
 	}
 }
 
-func (s *Shadow) send(req *http.Request) {
+func (s *Shadow) send(m *mirror) {
 	start := time.Now()
-	resp, err := s.Client.Do(req)
+	resp, err := s.Client.Do(m.req)
 	if err != nil {
 		ShadowErrors.Add(1)
 		return // Fail silently. Shadow problems must never surface to the client.
 	}
 	defer resp.Body.Close()
-	io.Copy(io.Discard, resp.Body) // Drain so the connection returns to the pool.
+
+	var shadow *capturedResponse
+	if m.primary != nil {
+		shadow = captureResponse(resp) // drains the body too
+	} else {
+		io.Copy(io.Discard, resp.Body) // Drain so the connection returns to the pool.
+	}
 
 	ShadowLatencyMicros.Add(time.Since(start).Microseconds())
 	ShadowDispatched.Add(1)
+
+	if shadow != nil {
+		s.record(m, shadow)
+	}
+}
+
+// record compares the two responses and files any disagreement.
+func (s *Shadow) record(m *mirror, shadow *capturedResponse) {
+	reasons := compareResponses(m.primary, shadow, s.ignore)
+	if len(reasons) == 0 {
+		DiffMatches.Add(1)
+		return
+	}
+	DiffMismatches.Add(1)
+	s.diffs.Add(Diff{
+		At:            time.Now().UTC(),
+		Method:        m.req.Method,
+		Path:          m.req.URL.Path,
+		PrimaryStatus: m.primary.Status,
+		ShadowStatus:  shadow.Status,
+		Reasons:       reasons,
+	})
 }
 
 // sampled reports whether this request is one of the mirrored ones.
