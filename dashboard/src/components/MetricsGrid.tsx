@@ -6,12 +6,14 @@ import {
   Timer,
   TrashIcon,
 } from 'lucide-react';
-import type { ProxyMetrics } from '@/lib/proxy-client';
+import type { Latency, ProxyMetrics } from '@/lib/proxy-client';
 
 // Fixed locale: the page is client-rendered but still server-rendered once, and
 // a locale-dependent separator would mismatch and trigger a hydration error.
 const count = new Intl.NumberFormat('en-US');
 const ms = new Intl.NumberFormat('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+const EMPTY_LATENCY: Latency = { p50: 0, p95: 0, p99: 0, max: 0, samples: 0 };
 
 interface StatProps {
   label: string;
@@ -54,6 +56,9 @@ export function MetricsGrid({ metrics, stale }: { metrics: ProxyMetrics | null; 
     activeConnections: 0,
     avgPrimaryLatencyMs: 0,
     avgShadowLatencyMs: 0,
+    primaryLatency: EMPTY_LATENCY,
+    shadowLatency: EMPTY_LATENCY,
+    proxyOverhead: EMPTY_LATENCY,
   };
 
   const mirroredPct =

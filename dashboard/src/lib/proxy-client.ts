@@ -10,7 +10,27 @@
 // `process.env.NEXT_PUBLIC_PROXY_URL` at build time for the browser bundle.
 const proxyUrl = () => process.env.NEXT_PUBLIC_PROXY_URL || 'http://localhost:8080';
 
+// Sent as a bearer token when the proxy is started with PROXY_API_TOKEN.
+//
+// NEXT_PUBLIC_ means the browser bundle contains it, so this authenticates the
+// dashboard to the proxy, not the operator to the dashboard: it stops anything
+// else that can reach the port from retuning live traffic, and stops nothing a
+// person with the dashboard open cannot already do. Put real user auth in front
+// of the dashboard if that distinction matters.
+const proxyToken = () => process.env.NEXT_PUBLIC_PROXY_TOKEN || '';
+
 const TIMEOUT_MS = 4000;
+
+/** Windowed latency percentiles in milliseconds, over the proxy's most recent
+ *  samples. `samples` is how many observations are behind them — a p99 over 6
+ *  requests is not a p99, and the UI says so rather than showing a number. */
+export interface Latency {
+  p50: number;
+  p95: number;
+  p99: number;
+  max: number;
+  samples: number;
+}
 
 export interface ProxyMetrics {
   primaryRequestsTotal: number;
@@ -19,6 +39,11 @@ export interface ProxyMetrics {
   activeConnections: number;
   avgPrimaryLatencyMs: number;
   avgShadowLatencyMs: number;
+  primaryLatency: Latency;
+  shadowLatency: Latency;
+  /** Time spent inside the proxy rather than waiting on the primary backend —
+   *  the cost of having Parallax in the request path, measured per request. */
+  proxyOverhead: Latency;
 }
 
 export interface ProxyConfig {
@@ -65,9 +90,20 @@ export class ProxyError extends Error {
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const url = `${proxyUrl()}${path}`;
 
+  const token = proxyToken();
+  const headers = new Headers(init?.headers);
+  if (token) {
+    headers.set('Authorization', `Bearer ${token}`);
+  }
+
   let res: Response;
   try {
-    res = await fetch(url, { ...init, cache: 'no-store', signal: AbortSignal.timeout(TIMEOUT_MS) });
+    res = await fetch(url, {
+      ...init,
+      headers,
+      cache: 'no-store',
+      signal: AbortSignal.timeout(TIMEOUT_MS),
+    });
   } catch (cause) {
     const timedOut = cause instanceof DOMException && cause.name === 'TimeoutError';
     throw new ProxyError(
@@ -76,6 +112,12 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     );
   }
 
+  if (res.status === 401) {
+    throw new ProxyError(
+      "Proxy rejected the control-plane token. Set NEXT_PUBLIC_PROXY_TOKEN to match the proxy's PROXY_API_TOKEN.",
+      { status: 401 },
+    );
+  }
   if (!res.ok) {
     throw new ProxyError(await errorMessage(res), { status: res.status });
   }

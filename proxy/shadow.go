@@ -4,10 +4,12 @@ import (
 	"errors"
 	"io"
 	"log"
+	"hash/fnv"
 	"math"
 	"math/rand/v2"
 	"net/http"
 	"net/url"
+	"path"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -56,6 +58,12 @@ type Shadow struct {
 	// request goroutine after that — unlike sampleUnits and enabled, this is
 	// not safe to retune while serving. nil means safeMethods.
 	methods map[string]bool
+
+	// ignorePaths are path.Match globs that are never mirrored, and traceCookie
+	// is the cookie to fall back on when a request carries no trace header.
+	// Written once at startup, like methods.
+	ignorePaths []string
+	traceCookie string
 
 	// queue is the bounded handoff to the worker pool. Full queue means drop.
 	queue chan *mirror
@@ -143,6 +151,41 @@ func (s *Shadow) SetMethods(methods []string) error {
 	return nil
 }
 
+// SetIgnorePaths excludes matching request paths from mirroring. Patterns are
+// path.Match globs: "/health", "/internal/*". Empty entries are ignored, so an
+// unset env var is a no-op.
+//
+// Health checks and readiness probes are the motivating case — they are high
+// volume, they tell you nothing when mirrored, and they crowd real traffic out
+// of the diff feed.
+//
+// Call it before the proxy starts serving; the list is read without a lock.
+func (s *Shadow) SetIgnorePaths(patterns []string) {
+	s.ignorePaths = s.ignorePaths[:0]
+	for _, p := range patterns {
+		if p = strings.TrimSpace(p); p != "" {
+			s.ignorePaths = append(s.ignorePaths, p)
+		}
+	}
+}
+
+// SetTraceCookie names the cookie that identifies a session, for browser
+// traffic that carries no trace header. Call it before serving.
+func (s *Shadow) SetTraceCookie(name string) { s.traceCookie = strings.TrimSpace(name) }
+
+// ignoredPath reports whether p is excluded from mirroring.
+//
+// ponytail: path.Match, so "*" stops at a "/" — "/internal/*" does not cover
+// "/internal/a/b". Add "/internal/*/*" or move to a prefix check if that bites.
+func (s *Shadow) ignoredPath(p string) bool {
+	for _, pat := range s.ignorePaths {
+		if ok, err := path.Match(pat, p); ok && err == nil {
+			return true
+		}
+	}
+	return false
+}
+
 // mirrors reports whether requests with this method are eligible for mirroring.
 func (s *Shadow) mirrors(method string) bool {
 	if s.methods == nil {
@@ -197,8 +240,14 @@ func (s *Shadow) Middleware(next http.Handler) http.Handler {
 			return
 		}
 
+		if s.ignoredPath(r.URL.Path) {
+			ShadowSkippedPath.Add(1)
+			next.ServeHTTP(w, r)
+			return
+		}
+
 		// Sample before buffering: unsampled requests never pay the copy.
-		if !s.sampled() {
+		if !s.sampled(r) {
 			ShadowUnsampled.Add(1)
 			next.ServeHTTP(w, r)
 			return
@@ -287,7 +336,9 @@ func (s *Shadow) send(m *mirror) {
 		io.Copy(io.Discard, resp.Body) // Drain so the connection returns to the pool.
 	}
 
-	ShadowLatencyMicros.Add(time.Since(start).Microseconds())
+	elapsed := time.Since(start).Microseconds()
+	ShadowLatencyMicros.Add(elapsed)
+	shadowLatency.Add(elapsed)
 	ShadowDispatched.Add(1)
 
 	if shadow != nil {
@@ -313,13 +364,22 @@ func (s *Shadow) record(m *mirror, shadow *capturedResponse) {
 	})
 }
 
+// traceHeaders are the identifiers a request may already carry that are stable
+// across every hop of one logical flow, most specific first.
+var traceHeaders = []string{"X-Trace-Id", "Traceparent", "X-Request-Id", "X-Correlation-Id"}
+
 // sampled reports whether this request is one of the mirrored ones.
 //
-// ponytail: independent per-request coin flip, not a counter-based every-Nth
-// scheme. Statistically equivalent at volume and immune to traffic that arrives
-// in a repeating pattern. Swap in a deterministic hash of a request ID if
-// mirroring needs to be reproducible.
-func (s *Shadow) sampled() bool {
+// It hashes a trace or session ID when the request carries one, so mirroring is
+// coherent per flow rather than per request: every hop of a sampled trace is
+// mirrored, and none of an unsampled one. A per-request coin flip mirrors
+// POST /cart/add while dropping the POST /login before it, and the shadow
+// backend answers 401 — a mismatch manufactured by the sampler, in a tool whose
+// entire output is mismatches.
+//
+// With no ID to key on it falls back to the coin flip, which is the honest
+// answer: there is nothing to be coherent about.
+func (s *Shadow) sampled(r *http.Request) bool {
 	if !s.enabled.Load() {
 		return false
 	}
@@ -329,9 +389,40 @@ func (s *Shadow) sampled() bool {
 		return false
 	case units >= 100*sampleScale:
 		return true
-	default:
-		return rand.Int64N(100*sampleScale) < units
 	}
+
+	if id := s.traceID(r); id != "" {
+		h := fnv.New64a()
+		h.Write([]byte(id))
+		return int64(h.Sum64()%(100*sampleScale)) < units
+	}
+	return rand.Int64N(100*sampleScale) < units
+}
+
+// traceID returns the flow identifier for r, or "" if it carries none.
+func (s *Shadow) traceID(r *http.Request) string {
+	for _, h := range traceHeaders {
+		v := strings.TrimSpace(r.Header.Get(h))
+		if v == "" {
+			continue
+		}
+		// W3C traceparent is "00-<trace-id>-<span-id>-<flags>". Only the
+		// trace-id field is stable across the flow; the span changes per hop,
+		// so hashing the whole header would be the coin flip with extra steps.
+		if strings.EqualFold(h, "Traceparent") {
+			if parts := strings.Split(v, "-"); len(parts) >= 2 {
+				return parts[1]
+			}
+			continue
+		}
+		return v
+	}
+	if s.traceCookie != "" {
+		if c, err := r.Cookie(s.traceCookie); err == nil {
+			return c.Value
+		}
+	}
+	return ""
 }
 
 func isMirrored(r *http.Request) bool {

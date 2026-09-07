@@ -267,10 +267,10 @@ func TestSampleRateBoundsAreAbsolute(t *testing.T) {
 	off := newTestShadow(nil, 0, 1)
 	on := newTestShadow(nil, 100, 1)
 	for i := 0; i < 1000; i++ {
-		if off.sampled() {
+		if off.sampled(httptest.NewRequest(http.MethodGet, "/", nil)) {
 			t.Fatal("sample rate 0 mirrored a request")
 		}
-		if !on.sampled() {
+		if !on.sampled(httptest.NewRequest(http.MethodGet, "/", nil)) {
 			t.Fatal("sample rate 100 skipped a request")
 		}
 	}
@@ -286,7 +286,7 @@ func TestSamplingApproximatesTheConfiguredRate(t *testing.T) {
 
 	hits := 0
 	for i := 0; i < n; i++ {
-		if s.sampled() {
+		if s.sampled(httptest.NewRequest(http.MethodGet, "/", nil)) {
 			hits++
 		}
 	}

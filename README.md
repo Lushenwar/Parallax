@@ -71,9 +71,13 @@ byte. Paths in the ignore list use `.` for nesting and `*` for any one segment: 
 | `SHADOW_WORKERS` | `64` | Goroutines draining the queue |
 | `DIFF_BUFFER` | `100` | Mismatches kept for the dashboard; `0` disables comparison entirely |
 | `DIFF_IGNORE` | *(empty)* | Comma-separated JSON paths whose differences are expected, e.g. `createdAt,items.*.id` |
+| `SHADOW_IGNORE_PATHS` | `/health,/healthz,/readyz,/livez,/metrics` | `path.Match` globs never mirrored, e.g. `/internal/*` |
+| `SHADOW_TRACE_COOKIE` | *(unset)* | Session cookie to key sampling on when a request carries no trace header |
+| `PROXY_API_TOKEN` | *(unset)* | Bearer token required on `/api/*`; unset = no auth |
 | `METRICS_PATH` | `/metrics` | expvar endpoint; empty disables |
 | `DASHBOARD_ORIGIN` | `http://localhost:3000` | Sole allowed CORS origin for `/api/*` |
 | `NEXT_PUBLIC_PROXY_URL` | `http://localhost:8080` | Where the dashboard looks for the proxy |
+| `NEXT_PUBLIC_PROXY_TOKEN` | *(unset)* | Token the dashboard sends; must match `PROXY_API_TOKEN` |
 
 #### Mirroring writes
 
@@ -111,9 +115,16 @@ Two things have to be true before hosting this somewhere makes sense:
 1. **The proxy needs a reachable HTTPS endpoint.** An HTTPS page fetching `http://localhost:8080`
    is blocked outright in Safari and only tolerated in Chrome/Firefox because they treat
    `localhost` as trustworthy. `DASHBOARD_ORIGIN` would also have to name the hosted origin.
-2. **`/api/config` needs authentication.** It has none. CORS pins it to a single origin, but that
-   is not an access control — anything that can reach the port can set the sample rate or flip the
-   mirroring kill switch on live traffic. Fine on a private port; not fine on a public one.
+2. **`/api/config` needs authentication.** Set `PROXY_API_TOKEN` and the matching
+   `NEXT_PUBLIC_PROXY_TOKEN`, and every `/api/*` call must present it as
+   `Authorization: Bearer <token>`. Unset, there is no auth at all — CORS pins the endpoint to one
+   origin, but CORS is a rule browsers agree to follow and curl has never agreed to anything, so
+   anything that can reach the port can retune live traffic.
+
+   Note what the token is and is not: `NEXT_PUBLIC_` puts it in the browser bundle, so it
+   authenticates *the dashboard* to the proxy, not *the operator* to the dashboard. It closes the
+   open port; it does not gate who may open the dashboard. That still wants real auth in front of
+   the dashboard itself.
 
 Until then, run it locally.
 
@@ -121,13 +132,20 @@ Until then, run it locally.
 
 ## Known limits
 
-* Latency is a lifetime running mean, not windowed — a spike will not show up as one.
 * Comparison holds the primary response in memory until the shadow answers, capped at 1MB. Larger responses are compared up to the cap and flagged as truncated.
 * Only status, `Content-Type` and body are compared. Other headers are ignored as a matter of course — they differ between two backends for reasons that have nothing to do with a regression.
 * SIGTERM drains in-flight primary requests (15s cap); queued mirrors are still dropped, by design.
-* No percentiles. Latency is a lifetime mean, so p95/p99 — the numbers that say whether a proxy in the request path is acceptable — cannot be read from a running process.
-* No measured overhead figure: the load tests show mirroring does not degrade the primary, which is not the same as proxy-vs-direct overhead.
-* No path filtering; the method allowlist is global, so `/health` is mirrored like anything else.
-* Sampling is an independent per-request coin flip, not reproducible per trace ID. For a stateful shadow this means partial flows: a mirrored `POST /cart/add` whose `POST /login` was never mirrored will 401.
+* Percentiles are windowed over the last 2048 requests per path, so they answer "how is it now",
+  not "how was it this morning". There is no history and no charting — every read is instantaneous.
+  `avgPrimaryLatencyMs` and `avgShadowLatencyMs` are still lifetime means, kept for compatibility.
+* Proxy overhead is measured as total handler time minus the primary backend's own round trip and
+  body read. It is honest about what the process costs in the path; it does not capture kernel-side
+  cost, or the extra network hop if the proxy and backend are on different machines.
+* Sampling hashes `X-Trace-Id`, `traceparent` (trace-id field), `X-Request-Id`,
+  `X-Correlation-Id`, or `SHADOW_TRACE_COOKIE`, so whole flows are mirrored or skipped together.
+  Traffic carrying none of those still falls back to a per-request coin flip, and still produces
+  partial flows.
+* Path filtering is `path.Match`, so `*` does not cross a `/`: `/internal/*` excludes
+  `/internal/debug` but not `/internal/a/b`.
 * WebSockets and SSE pass through to the primary and are never mirrored.
 * `maxBodySizeMB` is reported by the API but is a compile-time constant in the engine.

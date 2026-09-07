@@ -47,6 +47,16 @@ func main() {
 			log.Fatalf("SHADOW_METHODS: %v", err)
 		}
 
+		// Health checks and probes are high volume and tell you nothing when
+		// mirrored; they only crowd real traffic out of the diff feed.
+		shadow.SetIgnorePaths(strings.Split(env("SHADOW_IGNORE_PATHS", "/health,/healthz,/readyz,/livez,/metrics"), ","))
+
+		// Without a flow ID the sampler is a per-request coin flip, which
+		// mirrors a POST /cart/add whose POST /login was never mirrored and
+		// files the resulting 401 as a mismatch. Trace headers are checked
+		// automatically; name a session cookie for browser traffic that has none.
+		shadow.SetTraceCookie(env("SHADOW_TRACE_COOKIE", ""))
+
 		// Comparison is the reason the mirror exists, so it is on unless the
 		// operator turns it off with DIFF_BUFFER=0.
 		if diffBuffer := envInt("DIFF_BUFFER", 100); diffBuffer > 0 {
@@ -67,8 +77,15 @@ func main() {
 	// METRICS_PATH to "" if a real route collides with it.
 	mux := http.NewServeMux()
 	dashboardOrigin := env("DASHBOARD_ORIGIN", "http://localhost:3000")
-	mux.Handle("/api/", proxy.APIHandler(shadow, dashboardOrigin))
-	log.Printf("control plane on /api/ (CORS origin %s)", dashboardOrigin)
+	apiToken := env("PROXY_API_TOKEN", "")
+	mux.Handle("/api/", proxy.APIHandler(shadow, dashboardOrigin, apiToken))
+	if apiToken == "" {
+		log.Printf("control plane on /api/ (CORS origin %s) — UNAUTHENTICATED: "+
+			"anything that can reach %s can retune live traffic. Set PROXY_API_TOKEN before exposing this port.",
+			dashboardOrigin, addr)
+	} else {
+		log.Printf("control plane on /api/ (CORS origin %s, bearer token required)", dashboardOrigin)
+	}
 
 	if metricsPath := env("METRICS_PATH", "/metrics"); metricsPath != "" {
 		mux.Handle(metricsPath, proxy.MetricsHandler())
