@@ -30,7 +30,13 @@ jobs:
           node-version: '22'
           cache: npm
           cache-dependency-path: dashboard/package-lock.json
-      - run: npm ci
+      # ponytail: npm install, not npm ci. The lockfile is written on Windows
+      # ARM64, where npm never descends into the wasm32-wasi fallback builds of
+      # the Tailwind and ESLint native binaries, so it is missing entries that
+      # `npm ci` refuses to install without. The ceiling: the lock is advisory
+      # here rather than enforced. Switch back to `npm ci` once the lock is
+      # generated on Linux (a container, or a CI job that commits it).
+      - run: npm install --no-audit --no-fund
       - run: npm test
       - run: npm run typecheck
       - run: npm run lint
