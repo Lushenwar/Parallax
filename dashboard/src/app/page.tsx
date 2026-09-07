@@ -4,6 +4,7 @@ import { useCallback } from 'react';
 import { ControlPanel } from '@/components/ControlPanel';
 import { DiffFeed } from '@/components/DiffFeed';
 import { HealthBanner, HealthStatus } from '@/components/HealthStatus';
+import { LatencyPanel } from '@/components/LatencyPanel';
 import { MetricsGrid } from '@/components/MetricsGrid';
 import { fetchConfig, fetchDiffs, fetchMetrics, updateConfig, type ProxyConfig } from '@/lib/proxy-client';
 import { usePoll } from '@/lib/use-poll';
@@ -58,6 +59,8 @@ export default function DashboardPage() {
       ) : (
         <MetricsGrid metrics={metrics.data} stale={metrics.error !== null} />
       )}
+
+      <LatencyPanel metrics={metrics.data} stale={metrics.error !== null} />
 
       <ControlPanel
         config={config.data}

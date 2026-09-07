@@ -15,10 +15,13 @@ No direct commits to `main`. Every change goes: `git checkout -b <branch>` → c
 ║  Phase 3: Connection & Health Status Monitor    [DONE]   ║
 ╚══════════════════════════════════════════════════════════╝
 
-Phase: Complete, plus the comparator (`proxy/diff.go`, `proxy/capture.go`, `/api/diffs`, `DiffFeed.tsx`).
-Status: Parallax now compares shadow responses against what the client was served and reports the
+Phase: Complete, plus the comparator (`proxy/diff.go`, `proxy/capture.go`, `/api/diffs`, `DiffFeed.tsx`)
+and the runtime observability/safety pass (`proxy/latency.go`, `LatencyPanel.tsx`).
+Status: Parallax compares shadow responses against what the client was served and reports the
 mismatches — it is a response comparator, not just a mirror. Writes are off by default
-(`SHADOW_METHODS`), SIGTERM drains, and CI runs both halves.
+(`SHADOW_METHODS`), SIGTERM drains, and CI runs both halves. p50/p95/p99 and measured proxy
+overhead are readable at runtime, sampling is trace-coherent, `/health` and friends are excluded
+from mirroring, and `/api/*` takes a bearer token when `PROXY_API_TOKEN` is set.
 Update this as you finish each step.
 
 **Dashboard checks:** `cd dashboard && npm test && npm run typecheck && npm run lint && npm run build`
@@ -31,20 +34,28 @@ Update this as you finish each step.
 | `src/components/MetricsGrid.tsx` | Six live stat cards |
 | `src/components/ControlPanel.tsx` | Sample-rate slider, mirroring kill switch |
 | `src/components/HealthStatus.tsx` | Header chip + stale-data banner |
+| `src/components/LatencyPanel.tsx` | p50/p95/p99/max per path, plus measured proxy overhead |
 | `src/components/DiffFeed.tsx` | Response-mismatch feed |
 | `src/lib/proxy-client.ts` | Typed, timeout-bounded fetch wrapper |
 | `src/lib/use-poll.ts` | Interval polling with in-flight guard |
 | `src/lib/health.ts` | Pure connection-health derivation (unit tested) |
 
 ### Deferred
-* **Sampling is a per-request coin flip, so mirrored traffic is not trace-coherent.** Now the most consequential gap: with the comparator live, a mirrored `POST /cart/add` whose `POST /login` was never mirrored 401s, and the diff feed fills with false positives caused by the sampler rather than by the code under test. Hash a trace/session ID instead of flipping a coin. Only invisible today because the default allowlist is `GET,HEAD`.
-* No percentiles (`avgMillis` is a lifetime mean over `totalMicros/count`, and divides before converting, so sub-microsecond precision is dropped). p99 is the number that justifies a proxy in the request path and cannot currently be read at runtime.
-* No proxy-vs-direct overhead measurement, so no specific overhead figure is defensible.
-* No path filtering; `SHADOW_METHODS` is global.
-* Latency is a lifetime running mean, not windowed — a spike will not show as one. Needs a ring buffer, or histograms on the Go side.
-* No auth on `/api/config`. CORS is pinned to one origin, but anything that can reach the port can retune the proxy. Fine on a private port, not on a public one.
-* No charts or history: every number is an instantaneous read.
+* No history or charting: every number is an instantaneous read, and percentiles are windowed over
+  the last 2048 samples per path. Enough to see the tail now, not enough to see this morning.
+* Overhead is measured as total handler time minus the backend's round trip and body read. It does
+  not capture kernel-side cost or the extra network hop when the proxy and backend are on separate
+  machines, so it is a floor on the true cost, not the whole of it.
+* Sampling falls back to a per-request coin flip for traffic carrying no trace header and no
+  `SHADOW_TRACE_COOKIE`. Such flows are still mirrored in pieces.
+* Path filtering is `path.Match`, so `*` stops at a `/`. `/internal/*` does not cover
+  `/internal/a/b`; needs explicit patterns or a prefix mode.
+* `PROXY_API_TOKEN` is a shared bearer token, and the dashboard's copy ships in the browser bundle.
+  It closes the open port; it does not identify who is using the dashboard. Real user auth in front
+  of the dashboard is a separate job.
 * `maxBodySizeMB` is reported but not editable — it is a compile-time constant in the Go engine.
+* Latency windows are per-path, not per-route: one slow endpoint is averaged into the same p99 as
+  everything else.
 
 ## WHAT THIS FILE IS
 
@@ -77,9 +88,17 @@ The Go proxy exposes the following internal endpoints for the dashboard to consu
        "shadowRequestsDropped": 12,
        "activeConnections": 45,
        "avgPrimaryLatencyMs": 14.2,
-       "avgShadowLatencyMs": 85.5
+       "avgShadowLatencyMs": 85.5,
+       "primaryLatency": { "p50": 12.1, "p95": 40.5, "p99": 96.4, "max": 210.0, "samples": 2048 },
+       "shadowLatency":  { "p50": 80.0, "p95": 180.2, "p99": 340.9, "max": 900.1, "samples": 1024 },
+       "proxyOverhead":  { "p50": 0.21, "p95": 0.9, "p99": 2.4, "max": 11.7, "samples": 2048 }
      }
      ```
+   * `avg*` are lifetime means kept for compatibility. The `*Latency` objects are windowed over the
+     most recent samples and are the numbers to judge the proxy on; `samples` says how much data is
+     behind them, because a p99 over six requests is one request wearing a percentile's name.
+   * `proxyOverhead` is total handler time minus the primary backend's own round trip and body
+     read — what Parallax costs to have in the request path, measured on live traffic.
 2. **`GET /api/config`**
    * *Returns JSON:*
      ```json
@@ -124,6 +143,10 @@ The Go proxy exposes the following internal endpoints for the dashboard to consu
 * `sampleRate` must be a number in `[0, 100]`; anything else is rejected with 400.
 * Browser access requires CORS. The allowed origin is `DASHBOARD_ORIGIN` (default `http://localhost:3000`), never `*` — a wildcard would let any page a user visits retune production traffic.
 * Both fields are optional in the POST body; omitted fields are left unchanged.
+* When `PROXY_API_TOKEN` is set, every `/api/*` request must carry
+  `Authorization: Bearer <token>` or gets a 401. Preflight is answered before the check, since a
+  browser cannot attach the header to an `OPTIONS`. Unset, the check is off — that is the local
+  default and is not safe on a public port.
 
 ---
 

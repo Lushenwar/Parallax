@@ -1,8 +1,10 @@
 package proxy
 
 import (
+	"context"
 	"expvar"
 	"net/http"
+	"sync/atomic"
 	"time"
 )
 
@@ -20,12 +22,30 @@ var (
 	ShadowErrors        = expvar.NewInt("shadow_errors_total")
 	ShadowUnsampled     = expvar.NewInt("shadow_unsampled_total")
 	ShadowSkippedMethod = expvar.NewInt("shadow_skipped_method_total") // not in the method allowlist
+	ShadowSkippedPath   = expvar.NewInt("shadow_skipped_path_total")   // matched SHADOW_IGNORE_PATHS
 	ShadowTooLarge      = expvar.NewInt("shadow_too_large_total")
 	ShadowLoops         = expvar.NewInt("shadow_loops_blocked_total")
 	ShadowLatencyMicros = expvar.NewInt("shadow_latency_us_total")
 
 	DiffMatches    = expvar.NewInt("diff_matches_total")
 	DiffMismatches = expvar.NewInt("diff_mismatches_total")
+
+	// ProxyOverhead* is wall time spent inside this process rather than waiting
+	// on the primary backend: total handler time minus the backend round trip
+	// and body read. It is the answer to "what does putting Parallax in the
+	// request path cost?", measured on live traffic instead of inferred from a
+	// benchmark run against a different machine on a different day.
+	ProxyOverheadMicros = expvar.NewInt("proxy_overhead_us_total")
+	ProxyOverheadCount  = expvar.NewInt("proxy_overhead_samples_total")
+)
+
+// Windowed samples behind the percentiles. Counters above give lifetime totals;
+// these give the shape of the recent tail, which is the number that decides
+// whether a proxy in the request path is acceptable.
+var (
+	primaryLatency = newLatencyWindow(latencyWindowSize)
+	shadowLatency  = newLatencyWindow(latencyWindowSize)
+	proxyOverhead  = newLatencyWindow(latencyWindowSize)
 )
 
 // MetricsHandler serves the expvar registry as JSON.
@@ -39,13 +59,32 @@ func Instrument(next http.Handler) http.Handler {
 		PrimaryInFlight.Add(1)
 		defer PrimaryInFlight.Add(-1)
 
+		// The transport writes the backend's own time into this slot on the way
+		// past, so overhead falls out as a subtraction rather than needing a
+		// separate control run against the backend.
+		upstream := new(atomic.Int64)
+		r = r.WithContext(context.WithValue(r.Context(), upstreamKey{}, upstream))
+
 		rec := &statusRecorder{ResponseWriter: w}
 		next.ServeHTTP(rec, r)
 
+		total := time.Since(start).Microseconds()
 		PrimaryRequests.Add(1)
-		PrimaryLatencyMicros.Add(time.Since(start).Microseconds())
+		PrimaryLatencyMicros.Add(total)
+		primaryLatency.Add(total)
 		if rec.status >= 500 {
 			PrimaryErrors.Add(1)
+		}
+
+		// up == 0 means the request never reached the backend (a loop-guard
+		// rejection, say); there is no overhead to attribute. total == up is a
+		// real reading, not a bad one — on a warm loopback the proxy's own work
+		// lands under the clock's resolution, and discarding those samples
+		// would bias the reported overhead upward.
+		if up := upstream.Load(); up > 0 && total >= up {
+			ProxyOverheadMicros.Add(total - up)
+			ProxyOverheadCount.Add(1)
+			proxyOverhead.Add(total - up)
 		}
 	})
 }

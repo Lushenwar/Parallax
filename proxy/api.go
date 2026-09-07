@@ -1,11 +1,14 @@
 package proxy
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"io"
+	"math"
 	"log"
 	"net/http"
+	"strings"
 )
 
 // Metrics is the dashboard-facing view of the counters. The expvar names stay
@@ -17,6 +20,14 @@ type Metrics struct {
 	ActiveConnections        int64   `json:"activeConnections"`
 	AvgPrimaryLatencyMs      float64 `json:"avgPrimaryLatencyMs"`
 	AvgShadowLatencyMs       float64 `json:"avgShadowLatencyMs"`
+
+	// Windowed percentiles over recent traffic. The averages above are lifetime
+	// means kept for compatibility; these are the numbers to judge the proxy on.
+	// ProxyOverhead is time spent in this process rather than waiting on the
+	// primary backend — what Parallax costs to have in the request path.
+	PrimaryLatency Latency `json:"primaryLatency"`
+	ShadowLatency  Latency `json:"shadowLatency"`
+	ProxyOverhead  Latency `json:"proxyOverhead"`
 }
 
 // DiffReport is the comparison view: how many responses agreed, how many did
@@ -63,22 +74,38 @@ const maxConfigBody = 4 << 10
 // allowedOrigin is echoed as Access-Control-Allow-Origin. It is deliberately
 // never "*": these endpoints retune a proxy in the live request path, and a
 // wildcard would let any page the operator happens to visit do it.
-func APIHandler(shadow *Shadow, allowedOrigin string) http.Handler {
+//
+// token, when non-empty, is required as "Authorization: Bearer <token>" on
+// every endpoint. CORS is not access control — it is a rule browsers agree to
+// follow, and curl has never agreed to anything — so without a token anything
+// that can open the port can flip the kill switch on live traffic.
+func APIHandler(shadow *Shadow, allowedOrigin, token string) http.Handler {
+	guard := func(methods ...string) func(http.ResponseWriter, *http.Request) bool {
+		return func(w http.ResponseWriter, r *http.Request) bool {
+			if !cors(w, r, allowedOrigin, methods...) {
+				return false
+			}
+			return authorized(w, r, token)
+		}
+	}
+
 	mux := http.NewServeMux()
+	readOnly := guard(http.MethodGet)
 	mux.HandleFunc("/api/metrics", func(w http.ResponseWriter, r *http.Request) {
-		if !cors(w, r, allowedOrigin, http.MethodGet) {
+		if !readOnly(w, r) {
 			return
 		}
 		writeJSON(w, http.StatusOK, currentMetrics())
 	})
 	mux.HandleFunc("/api/diffs", func(w http.ResponseWriter, r *http.Request) {
-		if !cors(w, r, allowedOrigin, http.MethodGet) {
+		if !readOnly(w, r) {
 			return
 		}
 		writeJSON(w, http.StatusOK, currentDiffs(shadow))
 	})
+	config := guard(http.MethodGet, http.MethodPost)
 	mux.HandleFunc("/api/config", func(w http.ResponseWriter, r *http.Request) {
-		if !cors(w, r, allowedOrigin, http.MethodGet, http.MethodPost) {
+		if !config(w, r) {
 			return
 		}
 		if r.Method == http.MethodPost {
@@ -88,6 +115,24 @@ func APIHandler(shadow *Shadow, allowedOrigin string) http.Handler {
 		writeJSON(w, http.StatusOK, currentConfig(shadow))
 	})
 	return mux
+}
+
+// authorized checks the bearer token and reports whether handling continues.
+// An empty configured token disables the check, which is the local-development
+// default; PROXY_API_TOKEN turns it on.
+func authorized(w http.ResponseWriter, r *http.Request, token string) bool {
+	if token == "" {
+		return true
+	}
+	got, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+	// Constant time so the response time cannot be used to guess the token a
+	// character at a time. The length check leaks only the length.
+	if ok && subtle.ConstantTimeCompare([]byte(got), []byte(token)) == 1 {
+		return true
+	}
+	w.Header().Set("WWW-Authenticate", `Bearer realm="parallax control plane"`)
+	writeError(w, http.StatusUnauthorized, "missing or invalid bearer token")
+	return false
 }
 
 func currentMetrics() Metrics {
@@ -100,20 +145,25 @@ func currentMetrics() Metrics {
 		ActiveConnections:        PrimaryInFlight.Value(),
 		AvgPrimaryLatencyMs:      avgMillis(PrimaryLatencyMicros.Value(), requests),
 		AvgShadowLatencyMs:       avgMillis(ShadowLatencyMicros.Value(), dispatched),
+		PrimaryLatency:           primaryLatency.Latency(),
+		ShadowLatency:            shadowLatency.Latency(),
+		ProxyOverhead:            proxyOverhead.Latency(),
 	}
 }
 
 // avgMillis converts a cumulative microsecond counter into a mean in
 // milliseconds, rounded to two decimals.
 //
-// ponytail: a running mean over process lifetime, not a windowed one. It tells
-// you the steady state, not the last 30 seconds. Add a ring buffer if the
-// dashboard ever needs to show a latency spike as it happens.
+// It is a running mean over process lifetime: the steady state, not the last
+// 30 seconds, and blind to the tail by construction. Metrics.PrimaryLatency is
+// the windowed percentile view; this stays for callers already reading it.
 func avgMillis(totalMicros, count int64) float64 {
 	if count <= 0 {
 		return 0
 	}
-	return float64(totalMicros/count) / 1000
+	// Convert before dividing — the other order truncates every sub-millisecond
+	// mean to a flat 0, which is most of them for a proxy.
+	return math.Round(float64(totalMicros)/float64(count)/10) / 100
 }
 
 func currentDiffs(shadow *Shadow) DiffReport {
@@ -176,7 +226,7 @@ func cors(w http.ResponseWriter, r *http.Request, allowedOrigin string, methods 
 	if allowedOrigin != "" {
 		w.Header().Set("Access-Control-Allow-Origin", allowedOrigin)
 		w.Header().Set("Access-Control-Allow-Methods", join(methods)+", OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 		w.Header().Add("Vary", "Origin")
 	}
 	if r.Method == http.MethodOptions {

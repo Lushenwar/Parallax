@@ -24,7 +24,9 @@ func NewPrimary(primaryURL string) (*httputil.ReverseProxy, error) {
 	}
 
 	return &httputil.ReverseProxy{
-		Transport: PrimaryTransport,
+		// measuredTransport, not PrimaryTransport directly: the overhead figure
+		// needs to know how much of each request was the backend's own time.
+		Transport: measuredTransport{PrimaryTransport},
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			pr.SetURL(target)
 			pr.Out.Host = target.Host

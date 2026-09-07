@@ -8,6 +8,8 @@ import { after, before, test } from 'node:test';
 
 let server: Server;
 let lastBody = '';
+let lastAuth = '';
+let requireToken = false;
 
 before(async () => {
   server = createServer((req, res) => {
@@ -15,7 +17,14 @@ before(async () => {
     req.on('data', (c: Buffer) => chunks.push(c));
     req.on('end', () => {
       lastBody = Buffer.concat(chunks).toString();
+      lastAuth = req.headers.authorization ?? '';
       res.setHeader('Content-Type', 'application/json');
+
+      if (requireToken && lastAuth !== 'Bearer s3cret') {
+        res.statusCode = 401;
+        res.end(JSON.stringify({ error: 'missing or invalid bearer token' }));
+        return;
+      }
 
       if (req.url === '/api/metrics') {
         res.end(
@@ -26,6 +35,9 @@ before(async () => {
             activeConnections: 45,
             avgPrimaryLatencyMs: 14.2,
             avgShadowLatencyMs: 85.5,
+            primaryLatency: { p50: 12.1, p95: 40.5, p99: 96.4, max: 210.0, samples: 2048 },
+            shadowLatency: { p50: 80.0, p95: 180.2, p99: 340.9, max: 900.1, samples: 1024 },
+            proxyOverhead: { p50: 0.21, p95: 0.9, p99: 2.4, max: 11.7, samples: 2048 },
           }),
         );
         return;
@@ -59,6 +71,10 @@ test('fetchMetrics parses the proxy metrics shape', async () => {
   assert.equal(m.primaryRequestsTotal, 14250);
   assert.equal(m.shadowRequestsDropped, 12);
   assert.equal(m.avgShadowLatencyMs, 85.5);
+  // The tail is the number the proxy is judged on, so it has to survive the trip.
+  assert.equal(m.primaryLatency.p99, 96.4);
+  assert.equal(m.proxyOverhead.p99, 2.4);
+  assert.equal(m.proxyOverhead.samples, 2048);
 });
 
 test('fetchConfig parses the proxy config shape', async () => {
@@ -109,4 +125,30 @@ test('an unreachable proxy is flagged as unreachable, not as a bad response', as
   );
 
   process.env.NEXT_PUBLIC_PROXY_URL = previous;
+});
+
+test('the control-plane token is sent as a bearer header when configured', async () => {
+  process.env.NEXT_PUBLIC_PROXY_TOKEN = 's3cret';
+  requireToken = true;
+
+  const { fetchMetrics } = await import('./proxy-client.ts');
+  await fetchMetrics();
+  assert.equal(lastAuth, 'Bearer s3cret');
+
+  // A wrong token must fail loudly with something an operator can act on, not
+  // with a generic "proxy returned 401".
+  process.env.NEXT_PUBLIC_PROXY_TOKEN = 'wrong';
+  const { ProxyError } = await import('./proxy-client.ts');
+  await assert.rejects(
+    () => fetchMetrics(),
+    (err: unknown) => {
+      assert.ok(err instanceof ProxyError);
+      assert.equal(err.status, 401);
+      assert.match(err.message, /NEXT_PUBLIC_PROXY_TOKEN/);
+      return true;
+    },
+  );
+
+  requireToken = false;
+  delete process.env.NEXT_PUBLIC_PROXY_TOKEN;
 });

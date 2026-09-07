@@ -13,7 +13,7 @@ const testOrigin = "http://localhost:3000"
 
 func apiServer(t *testing.T, shadow *Shadow) *httptest.Server {
 	t.Helper()
-	srv := httptest.NewServer(APIHandler(shadow, testOrigin))
+	srv := httptest.NewServer(APIHandler(shadow, testOrigin, ""))
 	t.Cleanup(srv.Close)
 	return srv
 }
@@ -134,11 +134,11 @@ func TestDisablingShadowStopsSampling(t *testing.T) {
 	target, _ := url.Parse("http://shadow.internal")
 	shadow := newTestShadow(target, 100, 4)
 
-	if !shadow.sampled() {
+	if !shadow.sampled(httptest.NewRequest(http.MethodGet, "/", nil)) {
 		t.Fatal("expected sampling at 100%")
 	}
 	shadow.SetEnabled(false)
-	if shadow.sampled() {
+	if shadow.sampled(httptest.NewRequest(http.MethodGet, "/", nil)) {
 		t.Error("sampling continued after the shadow was disabled")
 	}
 }
